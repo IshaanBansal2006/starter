@@ -192,3 +192,79 @@ def test_spine_nodes_follow_rank_zero_path():
     assert spine and t.parent[spine[0]] == 0 and all(t.rank[n] == 0 for n in spine)
     for a, b in zip(spine, spine[1:]):
         assert t.parent[b] == a
+
+
+def test_accept_kernel_matches_host_walk():
+    """The device accept must reproduce ``Recycler.accept`` node for node, and
+    carry the round bookkeeping the host used to keep: the new root, the token
+    counter, and the frozen flag for the next round."""
+    from kernels.accept import accept_paths
+    from recycle import Recycler
+
+    torch.manual_seed(0)
+    B, vocab, cap = 5, 64, 40
+    for rows in (2, 4, 16, 64):
+        rec = Recycler(vocab, B, rows, 8, "cuda")
+        maxa, guard = rec.maxa, 2 * rows
+        for trial in range(20):
+            cand = torch.randint(0, 6, (B, rows), dtype=torch.int64, device="cuda")
+            blk = torch.randint(0, 6, (B, rows), dtype=torch.int64, device="cuda")
+            for b in range(B):  # plant a real path so the walk has something to find
+                node = 0
+                while rec.template.children[node] and torch.rand(()).item() > 0.25:
+                    kids = rec.template.children[node]
+                    node = kids[int(torch.randint(0, len(kids), ()).item())]
+                    blk[b, node] = cand[b, rec.template.parent[node]]
+            pos = torch.randint(10, 20, (B,), dtype=torch.int32, device="cuda")
+            nseen = torch.randint(1, 4, (B,), dtype=torch.int32, device="cuda")
+            done = (torch.rand(B, device="cuda") < 0.3).to(torch.int32)
+            limit_v = int(torch.randint(1, 8, ()).item())
+            limit = torch.tensor([limit_v], dtype=torch.int32, device="cuda")
+            root = torch.randint(0, vocab, (B,), dtype=torch.int64, device="cuda")
+            path_idx = torch.full((B, maxa), 99, dtype=torch.int32, device="cuda")
+            path_len = torch.zeros((B,), dtype=torch.int32, device="cuda")
+            acc_tok = torch.zeros((B, maxa + 1), dtype=torch.int64, device="cuda")
+            acc_cnt = torch.zeros((B,), dtype=torch.int32, device="cuda")
+            was_frozen, seen0, pos0, root0 = done.tolist(), nseen.tolist(), pos.tolist(), root.tolist()
+            accept_paths(blk, cand, rec.child_start, rec.child_list, rec.child_par, done, nseen,
+                         pos, limit, root, path_idx, path_len, acc_tok, acc_cnt, cap, guard)
+            blk_l, cand_l = blk.tolist(), cand.tolist()
+            for b in range(B):
+                if was_frozen[b]:
+                    assert (int(path_len[b]), int(acc_cnt[b])) == (-1, 0)
+                    assert int(root[b]) == root0[b] and int(nseen[b]) == seen0[b]
+                    assert int(done[b]) == 1
+                    continue
+                toks, path = rec.accept(blk_l[b], cand_l[b])
+                assert int(path_len[b]) == len(path)
+                assert path_idx[b].tolist()[:len(path)] == path
+                assert int(acc_cnt[b]) == len(toks)
+                assert acc_tok[b].tolist()[:len(toks)] == toks
+                assert int(root[b]) == toks[-1]
+                assert int(nseen[b]) == seen0[b] + len(toks)
+                end = pos0[b] + len(path) + 1
+                assert int(done[b]) == int(int(nseen[b]) >= limit_v or end + guard >= cap)
+
+
+@pytest.mark.parametrize("rows", [4, 16, 64])
+def test_device_accept_loop_matches_judge(engine, reference, rows):
+    """The whole round — accept, compact, draft, verify — is one graph replay and
+    the host reads the accepted tokens a round behind, so the loop must still
+    yield exactly max_new steps, all inside the judge's margin."""
+    vocab = engine.model.cfg.vocab
+    g = torch.Generator().manual_seed(11)
+    base = torch.randint(0, vocab, (3, 20), generator=g).tolist()
+    ids = [row + row[:16] for row in base]
+    from engine import GraphPlan
+    rec = GraphPlan(engine.model, len(ids), len(ids[0]), 20, recycle_rows=rows)
+    rec.capture()
+    out = list(rec.run(ids, 20))
+    assert len(out) == 20 and all(len(step) == 3 for step in out)
+    judge(reference, ids, out)
+    assert rec.stats["rounds"] >= 1
+    assert rec.stats["rounds"] >= rec.stats["min_rounds"]
+    # Rounds are only queued when one more is certain, so none is ever wasted.
+    assert rec.stats["rounds"] == rec.stats["launched"]
+    out2 = list(rec.run([row[::-1] for row in ids], 9))
+    assert len(out2) == 9
+    judge(reference, [row[::-1] for row in ids], out2)
