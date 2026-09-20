@@ -357,11 +357,11 @@ class Engine:
         # not depend on how lucky its drafts were: the 25% spread gate.
         # Per-batch: a lone sequence accepts ~3 tokens a round; with 16 the slowest
         # sequence sets the pace, and its rounds already vary little.
-        self.tau_floor_by_batch = {1: 2.6, 2: 2.4, 4: 2.2, 8: 1.8}
+        self.tau_floor_by_batch = {1: 2.4, 2: 2.4, 4: 2.6, 8: 2.0}
         self.tau_floor_default = float(os.environ.get("ENGINE_TAU_FLOOR", "1.4"))
         # Tree nodes per sequence: each 64 query rows (16 nodes x 4 heads) that a
         # sequence's tree adds is another pass over its KV cache.
-        self.tree_rows_by_batch = {1: 64, 2: 48, 4: 32, 8: 16, 16: 8, 32: 4}
+        self.tree_rows_by_batch = {1: 64, 2: 32, 4: 16, 8: 8, 16: 4, 32: 4}
         self.self_check = os.environ.get("ENGINE_SELF_CHECK", "1") == "1"
         self.checked = False
         budget.start(PICKER_BUDGET_S)
