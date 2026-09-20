@@ -185,6 +185,7 @@ class GraphPlan:
         yield first
         yielded = 1
         queues = [[first[b]] for b in range(B)]
+        pos_host = [self.T] * B
         # pos is the root's slot at the start of each round; _advance adds
         # path_len + 1, so the first round starts one slot early with no path.
         ver.pos.copy_(plan.pos - 1)
@@ -216,7 +217,7 @@ class GraphPlan:
             rounds += 1
             lens, idxs, roots = [], [], []
             for b in range(B):
-                if len(queues[b]) >= max_new_tokens:
+                if len(queues[b]) >= max_new_tokens or pos_host[b] + 2 * R >= plan.cap:
                     # Frozen: re-verify the same block in place (len -1 leaves pos unchanged).
                     lens.append(-1); idxs.append([0] * self.maxa); roots.append(queues[b][-1]); continue
                 toks, path = rec.accept(blk[b], cand[b])
@@ -226,6 +227,7 @@ class GraphPlan:
                 lens.append(len(path))
                 idxs.append(path + [0] * (self.maxa - len(path)))
                 roots.append(toks[-1])
+                pos_host[b] += len(path) + 1
             self.host_spine.fill_(-1)
             for b in range(B):
                 if len(queues[b]) >= max_new_tokens:
@@ -421,7 +423,7 @@ class Engine:
     def _plan(self, B: int, T: int, max_new: int) -> GraphPlan:
         key = (B, T)
         plan = self.plans.get(key)
-        if plan is not None and T + max_new > plan.plan.cap:
+        if plan is not None and T + max_new + 2 * 64 > plan.plan.cap:
             _log(f"max_new_tokens={max_new} exceeds planned capacity {plan.plan.cap}; rebuilding")
             plan = None
         if plan is None:
