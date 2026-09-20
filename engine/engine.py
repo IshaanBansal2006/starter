@@ -100,7 +100,7 @@ class GraphPlan:
             self.host_path_len = torch.zeros((B,), dtype=torch.int32, pin_memory=True)
             self.host_root = torch.zeros((B,), dtype=torch.int64, pin_memory=True)
             self.host_spine = torch.full((B, self.recycler.S), -1, dtype=torch.int64, pin_memory=True)
-            self.spine_min_match = int(os.environ.get("ENGINE_SPINE_MIN_MATCH", "3"))
+            self.spine_min_match = int(os.environ.get("ENGINE_SPINE_MIN_MATCH", "2"))
         elif spec_k:
             self.verify = VerifyPlan(self.plan, spec_k + 1)
             self.cand = torch.empty((B, spec_k + 1), dtype=torch.int64, device=dev)
