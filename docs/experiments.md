@@ -176,3 +176,99 @@ score: 1109.2767773288615  failure:
 | public-0 | passed | 333.8 | 11.74x | 0.29 | 0.08 |  |
 | public-1 | passed | 518.1 | 5.58x | 0.65 | 0.10 |  |
 | public-2 | passed | 3019.1 | 7.32x | 0.69 | 0.11 |  |
+
+## 2026-09-20 09:26 UTC — official run `bc7ba174-8b29-44e0-b221-7782a66fbd9c` @ `7c8a578` — succeeded
+
+rerun of best (92d6da7)
+
+score: 1192.6502770148777  failure:  
+
+| workload | status | tok/s | speedup | ttft ratio | tpot ratio | message |
+|---|---|---:|---:|---:|---:|---|
+| public-0 | passed | 392.1 | 10.25x | 0.40 | 0.09 |  |
+| public-1 | passed | 536.8 | 4.48x | 0.64 | 0.13 |  |
+| public-2 | passed | 3380.2 | 5.81x | 0.65 | 0.14 |  |
+
+## 2026-09-20 09:36 UTC — official run `22e03353-fa06-4ccc-a962-4a544e7797f5` @ `7c8a578` — succeeded
+
+rerun of best (3fca11a)
+
+score: 1217.9429253934245  failure:  
+
+| workload | status | tok/s | speedup | ttft ratio | tpot ratio | message |
+|---|---|---:|---:|---:|---:|---|
+| public-0 | passed | 424.5 | 10.44x | 0.41 | 0.08 |  |
+| public-1 | passed | 535.8 | 4.15x | 0.64 | 0.14 |  |
+| public-2 | passed | 3451.1 | 5.60x | 0.64 | 0.15 |  |
+
+## 2026-09-20 09:44 UTC — official run `f84f2838-1ae7-4e05-b3b4-7b1fca56373c` @ `7c8a578` — succeeded
+
+median timing, no hysteresis (1228 base)
+
+score: 1225.7615001341674  failure:  
+
+| workload | status | tok/s | speedup | ttft ratio | tpot ratio | message |
+|---|---|---:|---:|---:|---:|---|
+| public-0 | passed | 403.3 | 7.59x | 0.52 | 0.12 |  |
+| public-1 | passed | 543.6 | 3.66x | 0.63 | 0.17 |  |
+| public-2 | passed | 3372.3 | 5.05x | 0.64 | 0.17 |  |
+
+## 2026-09-20 09:52 UTC — official run `2390cf29-e544-478d-8dcf-da0b00309f15` @ `7c8a578` — succeeded
+
+rerun 2 of best (3fca11a)
+
+score: 1186.5338591981802  failure:  
+
+| workload | status | tok/s | speedup | ttft ratio | tpot ratio | message |
+|---|---|---:|---:|---:|---:|---|
+| public-0 | passed | 394.0 | 8.70x | 0.45 | 0.10 |  |
+| public-1 | passed | 530.7 | 3.86x | 0.64 | 0.15 |  |
+| public-2 | passed | 3360.7 | 5.23x | 0.64 | 0.16 |  |
+
+## 2026-09-20 10:01 UTC — official run `ec3dec86-a494-4d8a-8e56-4ba4c9bcee50` @ `7c8a578` — succeeded
+
+rerun 3 of best (3fca11a)
+
+score: 1181.6512931189113  failure:  
+
+| workload | status | tok/s | speedup | ttft ratio | tpot ratio | message |
+|---|---|---:|---:|---:|---:|---|
+| public-0 | passed | 374.3 | 9.26x | 0.41 | 0.10 |  |
+| public-1 | passed | 517.5 | 4.09x | 0.64 | 0.14 |  |
+| public-2 | passed | 3340.0 | 6.01x | 0.64 | 0.14 |  |
+
+## 2026-09-20 10:10 UTC — official run `cfa557f8-52ba-4827-b305-74752c7f2b59` @ `7c8a578` — succeeded
+
+rerun of 7c8a578 (median timing base)
+
+score: 1224.8272892223451  failure:  
+
+| workload | status | tok/s | speedup | ttft ratio | tpot ratio | message |
+|---|---|---:|---:|---:|---:|---|
+| public-0 | passed | 425.2 | 11.16x | 0.38 | 0.08 |  |
+| public-1 | passed | 539.3 | 4.79x | 0.63 | 0.12 |  |
+| public-2 | passed | 3516.7 | 6.50x | 0.63 | 0.13 |  |
+
+## 2026-09-20 10:19 UTC — official run `615d43c1-c813-473d-a2fe-d50cc2153578` @ `7c8a578` — succeeded
+
+rerun 4 of best (3fca11a)
+
+score: 1230.3939429523302  failure:  
+
+| workload | status | tok/s | speedup | ttft ratio | tpot ratio | message |
+|---|---|---:|---:|---:|---:|---|
+| public-0 | passed | 399.1 | 9.22x | 0.47 | 0.10 |  |
+| public-1 | passed | 553.3 | 4.20x | 0.63 | 0.13 |  |
+| public-2 | passed | 3555.1 | 5.84x | 0.64 | 0.14 |  |
+
+## 2026-09-20 10:28 UTC — official run `9a571964-2ee4-4885-8c00-9d97d527830a` @ `7c8a578` — succeeded
+
+rerun 5 of best (3fca11a)
+
+score: 1223.9902890477847  failure:  
+
+| workload | status | tok/s | speedup | ttft ratio | tpot ratio | message |
+|---|---|---:|---:|---:|---:|---|
+| public-0 | passed | 354.1 | 10.03x | 0.37 | 0.09 |  |
+| public-1 | passed | 528.4 | 4.66x | 0.64 | 0.12 |  |
+| public-2 | passed | 3381.2 | 6.06x | 0.65 | 0.14 |  |
