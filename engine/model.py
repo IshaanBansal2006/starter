@@ -228,7 +228,7 @@ class Plan:
         self.attn_decode = torch.empty((B, 1, HQ, D), dtype=bf16, device=dev)
         log = lambda s: print(f"[engine] {s}", file=sys.stderr, flush=True)
         self.rope_fused = os.environ.get("ENGINE_ROPE_FUSED", "1") == "1"
-        backend = os.environ.get("ENGINE_PREFILL_SDPA", "")
+        backend = os.environ.get("ENGINE_PREFILL_SDPA", "cudnn")
         self.sdpa_backends = {
             "flash": [SDPBackend.FLASH_ATTENTION],
             "cudnn": [SDPBackend.CUDNN_ATTENTION],
