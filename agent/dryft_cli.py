@@ -6,6 +6,8 @@
     python agent/dryft_cli.py logs <run_id>
     python agent/dryft_cli.py runs | submissions | benchmark
     python agent/dryft_cli.py go [engine_dir] [--official]   -> submit + run + wait + report
+    python agent/dryft_cli.py latest [--official] [--note ..] -> run the newest push-created submission
+    python agent/dryft_cli.py leaderboard
 
 Reads DRYFT_TOKEN (and optional DRYFT_API, default https://htn.dryft.ai) from
 the environment or a ``.env`` file in the repo root. Every finished run is
@@ -163,7 +165,8 @@ def main(argv: list[str]) -> int:
     g = sub.add_parser("go"); g.add_argument("engine_dir", nargs="?", default="engine"); g.add_argument("--official", action="store_true"); g.add_argument("--note", default="")
     res = sub.add_parser("result"); res.add_argument("run_id"); res.add_argument("--wait", action="store_true"); res.add_argument("--note", default="")
     lg = sub.add_parser("logs"); lg.add_argument("run_id")
-    sub.add_parser("runs"); sub.add_parser("submissions"); sub.add_parser("benchmark")
+    sub.add_parser("runs"); sub.add_parser("submissions"); sub.add_parser("benchmark"); sub.add_parser("leaderboard")
+    lt = sub.add_parser("latest"); lt.add_argument("--official", action="store_true"); lt.add_argument("--no-wait", action="store_true"); lt.add_argument("--note", default="")
     args = ap.parse_args(argv)
     api = client()
 
@@ -175,6 +178,23 @@ def main(argv: list[str]) -> int:
         print(json.dumps(api._send("GET", "/api/v1/submissions"), indent=2)); return 0
     if args.cmd == "logs":
         print_logs(api, args.run_id); return 0
+    if args.cmd == "leaderboard":
+        board = api._send("GET", "/api/v1/challenges/decode/leaderboard")
+        print(f"ranked teams: {board.get('rankedTeams')}")
+        for it in board.get("items") or []:
+            mark = "  <-- you" if it.get("isYou") else ""
+            print(f"{it['rank']:3d} {it['team']:<24s} {it['score']:8.1f} tok/s{mark}")
+        return 0
+    if args.cmd == "latest":
+        items = api._send("GET", "/api/v1/submissions?limit=5").get("items") or []
+        if not items:
+            print("no submissions yet: connect the repository on https://htn.dryft.ai/bench and push to main")
+            return 1
+        newest = items[0]
+        print(f"newest submission {newest.get('id')} ({newest.get('name') or newest.get('label') or ''}) "
+              f"created {newest.get('createdAt')}")
+        args.submission_id = newest["id"]
+        args.cmd = "run"
     if args.cmd in ("submit", "go"):
         archive = package(ROOT / args.engine_dir)
         sid = api.submit(archive)
