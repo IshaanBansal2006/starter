@@ -438,14 +438,14 @@ class Engine:
         self.spec_k = int(os.environ.get("ENGINE_SPEC_K", "0")) or None
         self.spec_max_rows = int(os.environ.get("ENGINE_SPEC_MAX_ROWS", "192"))
         self.recycle = os.environ.get("ENGINE_RECYCLE", "1") == "1"
-        self.recycle_k = int(os.environ.get("ENGINE_RECYCLE_K", "12"))
+        self.recycle_k = int(os.environ.get("ENGINE_RECYCLE_K", "8"))
         # Minimum verify rounds per sample = (max_new - 1) / tau_floor. Rounds are
         # padded up to it (the last token is held back) so a sample's timing does
         # not depend on how lucky its drafts were: the 25% spread gate.
         # Per-batch: a lone sequence accepts ~3 tokens a round; with 16 the slowest
         # sequence sets the pace, and its rounds already vary little.
-        self.tau_floor_by_batch = {1: 99.0, 2: 99.0, 4: 99.0, 8: 99.0, 16: 99.0}
-        self.tau_floor_default = float(os.environ.get("ENGINE_TAU_FLOOR", "99.0"))
+        self.tau_floor_by_batch = {1: 3.0, 2: 2.8, 4: 2.9, 8: 2.2, 16: 1.7}
+        self.tau_floor_default = float(os.environ.get("ENGINE_TAU_FLOOR", "1.4"))
         # Tree nodes per sequence: each 64 query rows (16 nodes x 4 heads) that a
         # sequence's tree adds is another pass over its KV cache.
         self.tree_rows_by_batch = {1: 64, 2: 32, 4: 16, 8: 8, 16: 8, 32: 4}
