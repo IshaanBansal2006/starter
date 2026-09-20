@@ -93,17 +93,24 @@ def _kv_kernel(
 
 @triton.jit
 def _qkv_kernel(
-    qkv_ptr, qw_ptr, kw_ptr, cos_ptr, sin_ptr, pos_ptr, q_out_ptr, k_cache_ptr, v_cache_ptr,
+    qkv_ptr, qw_ptr, kw_ptr, cos_ptr, sin_ptr, pos_ptr, depth_ptr, q_out_ptr, k_cache_ptr, v_cache_ptr,
     T, CAP, eps,
-    ROW: tl.constexpr, HQ: tl.constexpr, HKV: tl.constexpr, D: tl.constexpr,
+    ROW: tl.constexpr, HQ: tl.constexpr, HKV: tl.constexpr, D: tl.constexpr, DEPTH: tl.constexpr,
 ):
     """One launch for every head: programs below HQ rotate a query head, the
-    rest normalise/rotate one key head and copy its value head into the cache."""
+    rest normalise/rotate one key head and copy its value head into the cache.
+    Row t of a sequence lives in cache slot pos + t; its rotary angle is that of
+    position pos + t for a chain, or pos + depth[t] for a draft tree, where
+    siblings legitimately share one absolute position."""
     row = tl.program_id(0)
     head = tl.program_id(1)
     b = row // T
     t = row % T
-    pos = tl.load(pos_ptr + b) + t
+    slot = tl.load(pos_ptr + b) + t
+    if DEPTH:
+        pos = tl.load(pos_ptr + b) + tl.load(depth_ptr + t)
+    else:
+        pos = slot
     HALF: tl.constexpr = D // 2
     d = tl.arange(0, HALF)
     tab = pos * D
@@ -129,12 +136,12 @@ def _qkv_kernel(
         w1 = tl.load(kw_ptr + d).to(tl.float32)
         w2 = tl.load(kw_ptr + HALF + d).to(tl.float32)
         o1, o2 = _norm_rope_row(x1, x2, w1, w2, cos1, cos2, sin1, sin2, eps, D)
-        slot = ((b * HKV + kh) * CAP + pos) * D
-        tl.store(k_cache_ptr + slot + d, o1)
-        tl.store(k_cache_ptr + slot + HALF + d, o2)
+        cslot = ((b * HKV + kh) * CAP + slot) * D
+        tl.store(k_cache_ptr + cslot + d, o1)
+        tl.store(k_cache_ptr + cslot + HALF + d, o2)
         vsrc = qkv_ptr + row * ROW + (HQ + HKV + kh) * D
-        tl.store(v_cache_ptr + slot + d, tl.load(vsrc + d))
-        tl.store(v_cache_ptr + slot + HALF + d, tl.load(vsrc + HALF + d))
+        tl.store(v_cache_ptr + cslot + d, tl.load(vsrc + d))
+        tl.store(v_cache_ptr + cslot + HALF + d, tl.load(vsrc + HALF + d))
 
 
 def qk_norm_rope_cache(
@@ -150,6 +157,7 @@ def qk_norm_rope_cache(
     T: int,
     eps: float,
     fused: bool = True,
+    depth: torch.Tensor | None = None,
 ) -> None:
     """Normalise, rotate and scatter one projection buffer.
 
@@ -163,10 +171,11 @@ def qk_norm_rope_cache(
     HKV, CAP = k_cache.shape[1], k_cache.shape[2]
     M = B * T
     ROW = qkv.stride(0)
-    if fused:
+    if fused or depth is not None:
         _qkv_kernel[(M, HQ + HKV)](
-            qkv, q_norm_w, k_norm_w, cos, sin, pos, q_out, k_cache, v_cache, T, CAP, eps,
-            ROW=ROW, HQ=HQ, HKV=HKV, D=D, num_warps=1,
+            qkv, q_norm_w, k_norm_w, cos, sin, pos, depth if depth is not None else pos, q_out, k_cache, v_cache,
+            T, CAP, eps,
+            ROW=ROW, HQ=HQ, HKV=HKV, D=D, DEPTH=depth is not None, num_warps=1,
         )
         return
     _q_kernel[(M, HQ)](

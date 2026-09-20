@@ -180,7 +180,7 @@ def decode_matmuls(m: Model, M: int, log) -> dict[str, object]:
 
 
 def run_layers(plan: "Plan", mm: dict, x: torch.Tensor, q_buf: torch.Tensor, attn_out: torch.Tensor,
-               attention, pos: torch.Tensor, R: int, rope_fused: bool) -> torch.Tensor:
+               attention, pos: torch.Tensor, R: int, rope_fused: bool, depth: torch.Tensor | None = None) -> torch.Tensor:
     """Decode/verify layer stack over ``M = B*R`` rows; returns the logits.
 
     The residual stream lives in two buffers: every fused norm-prologue GEMM
@@ -192,14 +192,17 @@ def run_layers(plan: "Plan", mm: dict, x: torch.Tensor, q_buf: torch.Tensor, att
     m, cfg = plan.model, plan.model.cfg
     B = plan.B
     HQ, D = cfg.heads, cfg.head_dim
-    zero = torch.zeros_like(x)
+    zero = plan.zero_rows.get(x.shape[0])
+    if zero is None:  # allocated once per row count, outside any captured graph's per-step work
+        zero = plan.zero_rows[x.shape[0]] = torch.zeros_like(x)
     xa, xb = torch.empty_like(x), torch.empty_like(x)
     cur, y = x, zero
     for i, layer in enumerate(m.layers):
+        k_i, v_i = plan.k_layers[i], plan.v_layers[i]
         qkv = mm["qkv"](cur, y, layer.in_norm, xa, layer.wqkv)
         qk_norm_rope_cache(qkv, layer.q_norm, layer.k_norm, m.cos, m.sin, pos,
-                           q_buf, plan.k_cache[i], plan.v_cache[i], R, cfg.eps, fused=rope_fused)
-        attention(q_buf, plan.k_cache[i], plan.v_cache[i], pos, attn_out)
+                           q_buf, k_i, v_i, R, cfg.eps, fused=rope_fused, depth=depth)
+        attention(q_buf, k_i, v_i, pos, attn_out)
         o = mm["o"](attn_out.view(B * R, HQ * D), layer.wo)
         act = mm["gu"](xa, o, layer.post_norm, xb, layer.wgu)
         y = mm["d"](act, layer.wd)
@@ -226,6 +229,9 @@ class Plan:
         self.pos = torch.zeros((B,), dtype=torch.int32, device=dev)
         self.k_cache = torch.zeros((cfg.layers, B, HKV, self.cap, D), dtype=bf16, device=dev)
         self.v_cache = torch.zeros((cfg.layers, B, HKV, self.cap, D), dtype=bf16, device=dev)
+        self.k_layers = [self.k_cache[i] for i in range(cfg.layers)]
+        self.v_layers = [self.v_cache[i] for i in range(cfg.layers)]
+        self.zero_rows: dict[int, torch.Tensor] = {}
         self.q_prefill = torch.empty((B, HQ, T, D), dtype=bf16, device=dev)
         self.q_decode = torch.empty((B, HQ, 1, D), dtype=bf16, device=dev)
         self.attn_decode = torch.empty((B, 1, HQ, D), dtype=bf16, device=dev)
@@ -247,8 +253,9 @@ class Plan:
         if os.environ.get("ENGINE_ATTN_DEFAULT") == "1":
             self.attention = DecodeAttention(B, HQ, HKV, D, self.cap, dev)
         else:
-            self.attention = pick_attention(B, HQ, HKV, D, self.cap, T + max_new // 2, dev, log)
+                self.attention = pick_attention(B, HQ, HKV, D, self.cap, T + max_new // 2, dev, log, maxlen=T + max_new + 64)
         self.mm = self._pick_decode_matmuls()
+        self.recycler = None
 
     def _pick_decode_matmuls(self) -> dict[str, object]:
         """Time cuBLAS against the Triton skinny GEMM for every decode shape."""
@@ -282,17 +289,32 @@ class Plan:
         x = F.embedding(self.ids.view(-1), m.embed)
         h = rms_norm(x, m.layers[0].in_norm, cfg.eps)
         for i, layer in enumerate(m.layers):
+            k_i, v_i = self.k_layers[i], self.v_layers[i]
             qkv = h @ layer.wqkv.t()
             qk_norm_rope_cache(qkv, layer.q_norm, layer.k_norm, m.cos, m.sin, self.pos,
-                               self.q_prefill, self.k_cache[i], self.v_cache[i], T, cfg.eps, fused=self.rope_fused)
-            a = self._prefill_attention(self.q_prefill, self.k_cache[i, :, :, :T], self.v_cache[i, :, :, :T])
+                               self.q_prefill, k_i, v_i, T, cfg.eps, fused=self.rope_fused)
+            a = self._prefill_attention(self.q_prefill, k_i[:, :, :T], v_i[:, :, :T])
             o = a.transpose(1, 2).reshape(B * T, HQ * D) @ layer.wo.t()
             h2 = add_rms_norm(x, o, layer.post_norm, cfg.eps)
             d = swiglu(h2 @ layer.wgu.t()) @ layer.wd.t()
             h = add_rms_norm(x, d, self._next_norm(i), cfg.eps)
         logits = h.view(B, T, cfg.hidden)[:, -1] @ m.lm_head.t()
+        if self.recycler is not None:
+            self._warm_table(h)
         self.pos.fill_(T)
         return logits
+
+    def _warm_table(self, h: torch.Tensor, chunk: int = 2048) -> None:
+        """Record the model's top-k continuation of every prompt token, so the
+        adjacency table already knows the text's habits before the first draft.
+        Only the last prompt position is a real output; the rest reuse the final
+        hidden states the prefill computed anyway, one LM-head chunk at a time."""
+        m = self.model
+        ids = self.ids.view(-1)
+        rows = h.shape[0]
+        for start in range(0, rows, chunk):
+            logits = h[start:start + chunk] @ m.lm_head.t()
+            self.recycler.update(ids[start:start + chunk], logits)
 
     @torch.inference_mode()
     def decode(self) -> torch.Tensor:
@@ -307,33 +329,42 @@ class Plan:
 
 
 class VerifyPlan:
-    """Speculative verification: R = K + 1 query rows per sequence in one pass.
+    """Speculative verification: R query rows per sequence in one pass.
 
-    Row 0 holds the last accepted token, rows 1..K hold drafts. The forward
-    writes all R positions into the cache and returns the greedy token after
-    every row; the host accepts the longest prefix of drafts that the model
-    itself predicts, exactly as plain greedy decode would have produced it.
+    Row 0 holds the last accepted token, rows 1..R-1 hold drafts, either a
+    chain (block-causal mask) or a tree (ancestor masks). The forward writes
+    all R positions into the cache and returns the greedy token after every
+    row; the host accepts the longest path the model itself predicts, exactly
+    as plain greedy decode would have produced it.
     """
 
-    def __init__(self, plan: Plan, K: int):
-        self.plan, self.K, self.R = plan, K, K + 1
+    def __init__(self, plan: Plan, R: int, tree: bool = False, recycler=None):
+        self.plan, self.R, self.tree = plan, R, tree
+        self.K = R - 1
+        self.recycler = recycler
         m, cfg, B = plan.model, plan.model.cfg, plan.B
         dev, bf16 = m.device, torch.bfloat16
         HQ, HKV, D = cfg.heads, cfg.kv_heads, cfg.head_dim
-        R = self.R
-        self.blk = torch.zeros((B, R), dtype=torch.int64, device=dev)
+        self.blk = recycler.blk if recycler is not None else torch.zeros((B, R), dtype=torch.int64, device=dev)
+        self.masks = recycler.masks if recycler is not None else None
         self.pos = torch.zeros((B,), dtype=torch.int32, device=dev)
         self.q = torch.empty((B, HQ, R, D), dtype=bf16, device=dev)
         self.attn_out = torch.empty((B, R, HQ, D), dtype=bf16, device=dev)
         log = lambda s: print(f"[engine] {s}", file=sys.stderr, flush=True)
-        self.attention = pick_attention(B, HQ, HKV, D, plan.cap, plan.T + plan.max_new // 2, dev, log, R=R)
+        self.attention = pick_attention(B, HQ, HKV, D, plan.cap, plan.T + plan.max_new // 2, dev, log, R=R, tree=tree,
+                                        maxlen=plan.T + plan.max_new + R + 64)
         self.mm = decode_matmuls(m, B * R, log)
 
     @torch.inference_mode()
     def verify(self) -> torch.Tensor:
-        """Consume ``blk`` at ``pos``; returns [B, R] greedy tokens, one per row."""
+        """Consume ``blk`` at ``pos``; returns [B, R] greedy tokens, one per row,
+        and (in recycling mode) records every row's top-k in the adjacency table."""
         plan = self.plan
         B, R = plan.B, self.R
         x = F.embedding(self.blk.view(-1), plan.model.embed)
-        logits = run_layers(plan, self.mm, x, self.q, self.attn_out, self.attention, self.pos, R, plan.rope_fused)
+        attention = (lambda q, k, v, pos, out: self.attention(q, k, v, pos, out, self.masks)) if self.tree else self.attention
+        depth = self.recycler.depth if self.recycler is not None else None
+        logits = run_layers(plan, self.mm, x, self.q, self.attn_out, attention, self.pos, R, plan.rope_fused, depth=depth)
+        if self.recycler is not None:
+            self.recycler.update(self.blk.view(-1), logits)
         return logits.argmax(dim=-1).view(B, R)
