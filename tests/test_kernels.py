@@ -110,3 +110,44 @@ def test_skinny_matmul_configs_match_cublas():
                 out = SkinnyMatmul(M, N, K, a.device, **cfg)(a, w).float()
                 err = (out - ref).abs().max().item()
                 assert err <= 0.02 * ref.abs().max().item() + 1e-3, (M, N, K, cfg, err)
+
+
+def test_fused_rope_launch_equals_split_launch():
+    from kernels import qk_norm_rope_cache
+    from model import Config, rope_tables
+    B, T, HQ, HKV, D, CAP = 2, 3, 8, 2, 128, 7
+    cfg = Config(hidden=0, intermediate=0, layers=0, heads=HQ, kv_heads=HKV, head_dim=D, vocab=0, eps=1e-6, rope_theta=5e6, tie_embeddings=True)
+    cos, sin = rope_tables(cfg, CAP, "cuda")
+    qkv = torch.randn(B * T, (HQ + 2 * HKV) * D, device="cuda", dtype=torch.bfloat16)
+    qw = 1 + 0.1 * torch.randn(D, device="cuda", dtype=torch.bfloat16)
+    kw = 1 + 0.1 * torch.randn(D, device="cuda", dtype=torch.bfloat16)
+    pos = torch.full((B,), 2, dtype=torch.int32, device="cuda")
+    outs = []
+    for fused in (False, True):
+        q_out = torch.empty(B, HQ, T, D, device="cuda", dtype=torch.bfloat16)
+        kc = torch.zeros(B, HKV, CAP, D, device="cuda", dtype=torch.bfloat16)
+        vc = torch.zeros_like(kc)
+        qk_norm_rope_cache(qkv, qw, kw, cos, sin, pos, q_out, kc, vc, T, 1e-6, fused=fused)
+        outs.append((q_out, kc, vc))
+    for a, b in zip(*outs):
+        assert torch.equal(a, b)
+
+
+def test_gateup_configs_match_cublas_swiglu():
+    from kernels import swiglu
+    from kernels.gemm import CONFIGS, SkinnyGateUp
+    for M in (1, 16):
+        I, K = 9728, 2560
+        a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+        wgu = torch.randn(2 * I, K, device="cuda", dtype=torch.bfloat16) * 0.02
+        ref = swiglu(a @ wgu.t()).float()
+        for cfg in CONFIGS:
+            out = SkinnyGateUp(M, I, K, a.device, **cfg)(a, wgu[:I], wgu[I:]).float()
+            err = (out - ref).abs().max().item()
+            assert err <= 0.02 * ref.abs().max().item() + 1e-3, (M, cfg, err)
+
+
+def test_pick_attention_returns_matching_kernel():
+    from kernels import pick_attention
+    attn = pick_attention(2, 8, 2, 128, 300, 250, "cuda")
+    assert attn.NSPLIT >= 1
