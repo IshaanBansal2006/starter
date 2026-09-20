@@ -22,25 +22,34 @@ import triton.language as tl
 def _split_kernel(
     q_ptr, k_ptr, v_ptr, pos_ptr, o_part_ptr, m_part_ptr, l_part_ptr, o_ptr,
     CAP, scale,
-    HQ: tl.constexpr, HKV: tl.constexpr, G: tl.constexpr, GP: tl.constexpr,
+    HQ: tl.constexpr, HKV: tl.constexpr, G: tl.constexpr, GP: tl.constexpr, R: tl.constexpr,
     D: tl.constexpr, BLOCK_N: tl.constexpr, NSPLIT: tl.constexpr, SPLIT_LEN: tl.constexpr,
     FINAL: tl.constexpr,
 ):
+    """Query tile rows are (t, g): query row t of the sequence, head kh*G + g.
+    Row t may see keys 0 .. pos[b] + t, which is causal inside the block of R
+    new tokens; the running max is guarded so rows with no valid key in a
+    split stay at (m=-inf, l=0, acc=0) instead of producing NaN."""
     b = tl.program_id(0)
     kh = tl.program_id(1)
     s = tl.program_id(2)
-    L = tl.load(pos_ptr + b) + 1
+    pos = tl.load(pos_ptr + b)
+    L = pos + R
     start = s * SPLIT_LEN
     end = tl.minimum(start + SPLIT_LEN, L)
 
     rows = tl.arange(0, GP)
+    t = rows // G
+    g = rows % G
+    head = kh * G + g
     d = tl.arange(0, D)
-    row_mask = rows < G
+    row_mask = rows < G * R
     q = tl.load(
-        q_ptr + ((b * HQ + kh * G + rows[:, None]) * D + d[None, :]),
+        q_ptr + (((b * HQ + head[:, None]) * R + t[:, None]) * D + d[None, :]),
         mask=row_mask[:, None], other=0.0,
     )
     kv_base = (b * HKV + kh) * CAP
+    row_limit = pos + t
 
     m = tl.full([GP], float("-inf"), tl.float32)
     l = tl.zeros([GP], tl.float32)
@@ -50,21 +59,21 @@ def _split_kernel(
         kmask = n < end
         k = tl.load(k_ptr + (kv_base + n[:, None]) * D + d[None, :], mask=kmask[:, None], other=0.0)
         sc = tl.dot(q, tl.trans(k)) * scale
-        sc = tl.where(kmask[None, :], sc, float("-inf"))
+        sc = tl.where(n[None, :] <= row_limit[:, None], sc, float("-inf"))
         m_new = tl.maximum(m, tl.max(sc, axis=1))
-        alpha = tl.exp(m - m_new)
-        p = tl.exp(sc - m_new[:, None])
+        m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
+        alpha = tl.exp(m - m_safe)
+        p = tl.exp(sc - m_safe[:, None])
         l = l * alpha + tl.sum(p, axis=1)
         v = tl.load(v_ptr + (kv_base + n[:, None]) * D + d[None, :], mask=kmask[:, None], other=0.0)
         acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v)
         m = m_new
 
-    head = kh * G + rows
     if FINAL:
         out = acc / l[:, None]
-        tl.store(o_ptr + (b * HQ + head[:, None]) * D + d[None, :], out.to(tl.bfloat16), mask=row_mask[:, None])
+        tl.store(o_ptr + ((b * R + t[:, None]) * HQ + head[:, None]) * D + d[None, :], out.to(tl.bfloat16), mask=row_mask[:, None])
     else:
-        part = (b * HQ + head) * NSPLIT + s
+        part = ((b * HQ + head) * R + t) * NSPLIT + s
         tl.store(o_part_ptr + part[:, None] * D + d[None, :], acc, mask=row_mask[:, None])
         tl.store(m_part_ptr + part, m, mask=row_mask)
         tl.store(l_part_ptr + part, l, mask=row_mask)
@@ -73,13 +82,14 @@ def _split_kernel(
 @triton.jit
 def _reduce_kernel(
     o_part_ptr, m_part_ptr, l_part_ptr, o_ptr,
-    HQ: tl.constexpr, D: tl.constexpr, NSPLIT: tl.constexpr, NSP: tl.constexpr,
+    HQ: tl.constexpr, R: tl.constexpr, D: tl.constexpr, NSPLIT: tl.constexpr, NSP: tl.constexpr,
 ):
     b = tl.program_id(0)
     h = tl.program_id(1)
+    t = tl.program_id(2)
     s = tl.arange(0, NSP)
     smask = s < NSPLIT
-    base = (b * HQ + h) * NSPLIT
+    base = ((b * HQ + h) * R + t) * NSPLIT
     m = tl.load(m_part_ptr + base + s, mask=smask, other=float("-inf"))
     l = tl.load(l_part_ptr + base + s, mask=smask, other=0.0)
     M = tl.max(m, axis=0)
@@ -88,17 +98,17 @@ def _reduce_kernel(
     d = tl.arange(0, D)
     o = tl.load(o_part_ptr + (base + s[:, None]) * D + d[None, :], mask=smask[:, None], other=0.0)
     out = tl.sum(o * w[:, None], axis=0) / L
-    tl.store(o_ptr + (b * HQ + h) * D + d, out.to(tl.bfloat16))
+    tl.store(o_ptr + ((b * R + t) * HQ + h) * D + d, out.to(tl.bfloat16))
 
 
 class DecodeAttention:
     """Workspace-owning wrapper; one instance per (B, HQ, cap) plan."""
 
     def __init__(self, B: int, HQ: int, HKV: int, D: int, cap: int, device, nsplit: int | None = None,
-                 block_n: int = 64, num_warps: int = 4, num_stages: int = 2):
-        self.B, self.HQ, self.HKV, self.D, self.cap = B, HQ, HKV, D, cap
+                 block_n: int = 64, num_warps: int = 4, num_stages: int = 2, R: int = 1):
+        self.B, self.HQ, self.HKV, self.D, self.cap, self.R = B, HQ, HKV, D, cap, R
         self.G = HQ // HKV
-        self.GP = max(16, triton.next_power_of_2(self.G))
+        self.GP = max(16, triton.next_power_of_2(self.G * R))
         self.BLOCK_N = block_n
         self.num_warps, self.num_stages = num_warps, num_stages
         if nsplit is None:
@@ -109,25 +119,26 @@ class DecodeAttention:
         self.NSPLIT = triton.cdiv(cap, self.SPLIT_LEN)
         self.NSP = triton.next_power_of_2(self.NSPLIT)
         self.scale = 1.0 / math.sqrt(D)
-        self.o_part = torch.empty((B, HQ, self.NSPLIT, D), dtype=torch.float32, device=device)
-        self.m_part = torch.empty((B, HQ, self.NSPLIT), dtype=torch.float32, device=device)
-        self.l_part = torch.empty((B, HQ, self.NSPLIT), dtype=torch.float32, device=device)
+        self.o_part = torch.empty((B, HQ, R, self.NSPLIT, D), dtype=torch.float32, device=device)
+        self.m_part = torch.empty((B, HQ, R, self.NSPLIT), dtype=torch.float32, device=device)
+        self.l_part = torch.empty((B, HQ, R, self.NSPLIT), dtype=torch.float32, device=device)
 
     def __call__(self, q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, pos: torch.Tensor, out: torch.Tensor) -> None:
-        """q [B, HQ, D] bf16; k/v_cache [B, HKV, cap, D]; pos [B] int32; out [B, HQ, D] bf16."""
+        """q [B, HQ, R, D] bf16; k/v_cache [B, HKV, cap, D]; pos [B] int32 (position of
+        query row 0); out [B, R, HQ, D] bf16, i.e. rows (b, t) of [B*R, HQ*D]."""
         _split_kernel[(self.B, self.HKV, self.NSPLIT)](
             q, k_cache, v_cache, pos, self.o_part, self.m_part, self.l_part, out,
             self.cap, self.scale,
-            HQ=self.HQ, HKV=self.HKV, G=self.G, GP=self.GP, D=self.D,
+            HQ=self.HQ, HKV=self.HKV, G=self.G, GP=self.GP, R=self.R, D=self.D,
             BLOCK_N=self.BLOCK_N, NSPLIT=self.NSPLIT, SPLIT_LEN=self.SPLIT_LEN,
             FINAL=self.NSPLIT == 1,
             num_warps=self.num_warps, num_stages=self.num_stages,
         )
         if self.NSPLIT == 1:
             return
-        _reduce_kernel[(self.B, self.HQ)](
+        _reduce_kernel[(self.B, self.HQ, self.R)](
             self.o_part, self.m_part, self.l_part, out,
-            HQ=self.HQ, D=self.D, NSPLIT=self.NSPLIT, NSP=self.NSP, num_warps=1,
+            HQ=self.HQ, R=self.R, D=self.D, NSPLIT=self.NSPLIT, NSP=self.NSP, num_warps=1,
         )
 
 
@@ -153,21 +164,38 @@ def _time(fn, iters: int = 30) -> float:
     return start.elapsed_time(end) / iters
 
 
-def pick_attention(B: int, HQ: int, HKV: int, D: int, cap: int, typical_len: int, device, log=None) -> DecodeAttention:
+def reference_attention(q, k, v, pos, R: int, scale: float) -> torch.Tensor:
+    """SDPA over the valid keys with the block-causal mask, returned as [B, R, HQ, D] (float)."""
+    import torch.nn.functional as F
+
+    B, HQ, _, D = q.shape
+    HKV = k.shape[1]
+    outs = []
+    for b in range(B):
+        L = int(pos[b]) + R
+        kb = k[b, :, :L].repeat_interleave(HQ // HKV, dim=0)
+        vb = v[b, :, :L].repeat_interleave(HQ // HKV, dim=0)
+        key_idx = torch.arange(L, device=q.device)
+        row_lim = int(pos[b]) + torch.arange(R, device=q.device)
+        mask = key_idx[None, :] <= row_lim[:, None]
+        o = F.scaled_dot_product_attention(q[b], kb, vb, attn_mask=mask[None], scale=scale)
+        outs.append(o.transpose(0, 1))
+    return torch.stack(outs).float()
+
+
+def pick_attention(B: int, HQ: int, HKV: int, D: int, cap: int, typical_len: int, device, log=None, R: int = 1) -> DecodeAttention:
     """Time every (config, split) pair on synthetic data at a typical sequence
     length and keep the fastest whose output matches SDPA; the split count
     trades parallelism against the extra reduce launch, so it is measured too."""
     import torch.nn.functional as F
 
-    q = torch.randn((B, HQ, D), dtype=torch.bfloat16, device=device)
+    q = torch.randn((B, HQ, R, D), dtype=torch.bfloat16, device=device)
     k = torch.randn((B, HKV, cap, D), dtype=torch.bfloat16, device=device)
     v = torch.randn((B, HKV, cap, D), dtype=torch.bfloat16, device=device)
-    pos = torch.full((B,), typical_len - 1, dtype=torch.int32, device=device)
-    out = torch.empty_like(q)
+    pos = torch.full((B,), typical_len - R, dtype=torch.int32, device=device)
+    out = torch.empty((B, R, HQ, D), dtype=torch.bfloat16, device=device)
     L = typical_len
-    ref = F.scaled_dot_product_attention(
-        q[:, :, None], k[:, :, :L], v[:, :, :L], scale=D ** -0.5, enable_gqa=True
-    )[:, :, 0].float()
+    ref = reference_attention(q, k, v, pos, R, D ** -0.5)
     programs_wanted = 256
     base = max(1, (programs_wanted + B * HKV - 1) // (B * HKV))
     splits = sorted({1, max(1, base // 2), base, min(32, base * 2)})
@@ -175,7 +203,7 @@ def pick_attention(B: int, HQ: int, HKV: int, D: int, cap: int, typical_len: int
     for cfg in ATTN_CONFIGS:
         for nsplit in splits:
             try:
-                attn = DecodeAttention(B, HQ, HKV, D, cap, device, nsplit=nsplit, **cfg)
+                attn = DecodeAttention(B, HQ, HKV, D, cap, device, nsplit=nsplit, R=R, **cfg)
                 attn(q, k, v, pos, out)
                 err = (out.float() - ref).abs().max().item()
                 if err > 0.02 * ref.abs().max().item() + 1e-3:
@@ -193,5 +221,5 @@ def pick_attention(B: int, HQ: int, HKV: int, D: int, cap: int, typical_len: int
         raise RuntimeError("no decode attention configuration compiled; see the log above")
     if log:
         kv_bytes = 2 * B * HKV * L * D * 2
-        log(f"attention B={B} len={L}: {best_name} {best_ms * 1000:.1f}us ({kv_bytes / best_ms / 1e6:.0f} GB/s)")
+        log(f"attention B={B} R={R} len={L}: {best_name} {best_ms * 1000:.1f}us ({kv_bytes / best_ms / 1e6:.0f} GB/s)")
     return best

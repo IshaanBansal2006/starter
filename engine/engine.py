@@ -35,7 +35,8 @@ _ensure_triton_cache()
 
 import torch
 
-from model import Model, Plan
+from model import Model, Plan, VerifyPlan
+from spec import NGramDrafter
 
 
 def _log(msg: str) -> None:
@@ -43,13 +44,23 @@ def _log(msg: str) -> None:
 
 
 class GraphPlan:
-    def __init__(self, model: Model, B: int, T: int, max_new: int):
+    def __init__(self, model: Model, B: int, T: int, max_new: int, spec_k: int | None = None):
         self.plan = Plan(model, B, T, max_new)
         self.B, self.T, self.max_new = B, T, max_new
         self.g_prefill: torch.cuda.CUDAGraph | None = None
         self.g_decode: torch.cuda.CUDAGraph | None = None
+        self.g_verify: torch.cuda.CUDAGraph | None = None
         self.host_tok = torch.empty((2, B), dtype=torch.int64, pin_memory=True)
         self.events = [torch.cuda.Event() for _ in range(2)]
+        self.spec_k = spec_k
+        self.verify: VerifyPlan | None = None
+        self.stats: dict[str, float] = {}
+        if spec_k:
+            self.verify = VerifyPlan(self.plan, spec_k)
+            self.cand = torch.empty((B, spec_k + 1), dtype=torch.int64, device=model.device)
+            self.host_blk = torch.empty((B, spec_k + 1), dtype=torch.int64, pin_memory=True)
+            self.host_pos = torch.empty((B,), dtype=torch.int32, pin_memory=True)
+            self.host_cand = torch.empty((B, spec_k + 1), dtype=torch.int64, pin_memory=True)
 
     def _warm_eager(self, steps: int = 3) -> None:
         plan = self.plan
@@ -59,6 +70,10 @@ class GraphPlan:
             plan.tok.copy_(plan.prefill().argmax(dim=-1))
             for _ in range(steps):
                 plan.tok.copy_(plan.decode().argmax(dim=-1))
+            if self.verify is not None:
+                self.verify.pos.copy_(plan.pos)
+                self.verify.blk.copy_(plan.tok[:, None].expand(-1, self.verify.R))
+                self.cand.copy_(self.verify.verify())
         torch.cuda.current_stream().wait_stream(stream)
         torch.cuda.synchronize()
 
@@ -72,6 +87,10 @@ class GraphPlan:
         self.g_decode = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.g_decode):
             plan.tok.copy_(plan.decode().argmax(dim=-1))
+        if self.verify is not None:
+            self.g_verify = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self.g_verify):
+                self.cand.copy_(self.verify.verify())
         torch.cuda.synchronize()
         _log(f"captured graphs for B={self.B} T={self.T} new={self.max_new} in {time.perf_counter() - t0:.1f}s")
 
@@ -87,6 +106,57 @@ class GraphPlan:
         else:
             self.g_decode.replay()
 
+    def _step_verify(self) -> None:
+        if self.g_verify is None:
+            self.cand.copy_(self.verify.verify())
+        else:
+            self.g_verify.replay()
+
+    def run_spec(self, input_ids: list[list[int]], max_new_tokens: int):
+        """Speculative loop: verify K drafts per sequence per round, yield steps
+        as soon as every sequence has a token for them. Output is identical to
+        plain greedy decode because only model-predicted tokens are kept."""
+        plan, ver = self.plan, self.verify
+        B, K, R = self.B, self.spec_k, self.verify.R
+        plan.ids.copy_(torch.tensor(input_ids, dtype=torch.int64))
+        self._step_prefill()
+        first = plan.tok.tolist()
+        yield first
+        yielded = 1
+        queues = [[first[b]] for b in range(B)]
+        drafters = [NGramDrafter(input_ids[b] + [first[b]], K) for b in range(B)]
+        pos = [self.T] * B
+        blk = [[first[b]] + drafters[b].draft() for b in range(B)]
+        rounds = accepted = 0
+        while yielded < max_new_tokens:
+            self.host_blk.copy_(torch.tensor(blk, dtype=torch.int64))
+            self.host_pos.copy_(torch.tensor(pos, dtype=torch.int32))
+            ver.blk.copy_(self.host_blk, non_blocking=True)
+            ver.pos.copy_(self.host_pos, non_blocking=True)
+            self._step_verify()
+            self.host_cand.copy_(self.cand, non_blocking=True)
+            torch.cuda.current_stream().synchronize()
+            cand = self.host_cand.tolist()
+            rounds += 1
+            for b in range(B):
+                if len(queues[b]) >= max_new_tokens:
+                    continue
+                a = 0
+                while a < K and blk[b][a + 1] == cand[b][a]:
+                    a += 1
+                new = cand[b][:a + 1]
+                queues[b].extend(new)
+                drafters[b].extend(new)
+                accepted += a
+                pos[b] += a + 1
+                blk[b] = [cand[b][a]] + drafters[b].draft()
+            while yielded < max_new_tokens and all(len(q) > yielded for q in queues):
+                yield [q[yielded] for q in queues]
+                yielded += 1
+        self.stats = {"rounds": rounds, "accepted": accepted, "steps": max_new_tokens}
+        _log(f"spec: {rounds} rounds for {max_new_tokens} steps x {B} seqs, {accepted} drafts accepted "
+             f"({accepted / max(1, rounds * B * K):.2f} per draft slot)")
+
     def run(self, input_ids: list[list[int]], max_new_tokens: int):
         """Yield one token list per step, keeping the GPU one step ahead of the host.
 
@@ -94,6 +164,9 @@ class GraphPlan:
         event; step t+1 is launched *before* waiting on that event, so the
         harness's read of step t overlaps the compute of step t+1.
         """
+        if self.verify is not None:
+            yield from self.run_spec(input_ids, max_new_tokens)
+            return
         plan = self.plan
         plan.ids.copy_(torch.tensor(input_ids, dtype=torch.int64), non_blocking=False)
         host = self.host_tok
@@ -121,8 +194,10 @@ class Engine:
         self.model = Model(model_path)
         torch.cuda.synchronize()
         _log(f"loaded {model_path} in {time.perf_counter() - t0:.1f}s")
-        self.plans: dict[tuple[int, int, int], GraphPlan] = {}
+        self.plans: dict[tuple[int, int], GraphPlan] = {}
         self.use_graphs = os.environ.get("ENGINE_NO_GRAPHS") is None
+        self.spec_k = int(os.environ.get("ENGINE_SPEC_K", "0")) or None
+        self.spec_max_rows = int(os.environ.get("ENGINE_SPEC_MAX_ROWS", "64"))
 
     def _plan(self, B: int, T: int, max_new: int) -> GraphPlan:
         key = (B, T)
@@ -133,7 +208,8 @@ class Engine:
         if plan is None:
             self.plans.clear()
             torch.cuda.empty_cache()
-            plan = GraphPlan(self.model, B, T, max_new)
+            spec_k = self.spec_k if self.spec_k and B * (self.spec_k + 1) <= self.spec_max_rows else None
+            plan = GraphPlan(self.model, B, T, max_new, spec_k=spec_k)
             if self.use_graphs:
                 plan.capture()
             self.plans[key] = plan
