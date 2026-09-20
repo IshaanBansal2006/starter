@@ -177,3 +177,31 @@ def test_norm_prologue_matches_add_norm_then_gemm():
             out2 = SkinnyGateUp(M, I, K, x.device, **cfg)(x, wgu[:I], wgu[I:], norm=(y, wn, xout2, 1e-6)).float()
             assert torch.equal(xout2, xout_ref), (M, cfg)
             assert (out2 - ref_gu.float()).abs().max().item() <= 0.02 * ref_gu.abs().max().item() + 1e-3, (M, cfg)
+
+
+def test_gemv_configs_match_cublas():
+    from kernels import swiglu
+    from kernels.add_rmsnorm import add_rms_norm
+    from kernels.gemm import GEMV_CONFIGS, Gemv
+    torch.manual_seed(1)
+    for M in (1, 2, 4):
+        K, N, I = 2560, 1536, 1024
+        a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+        y = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+        wn = 1 + 0.1 * torch.randn(K, device="cuda", dtype=torch.bfloat16)
+        w = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.02
+        wgu = torch.randn(2 * I, K, device="cuda", dtype=torch.bfloat16) * 0.02
+        ref = (a @ w.t()).float()
+        ref_gu = swiglu(a @ wgu.t()).float()
+        xout_ref = torch.empty_like(a)
+        h = add_rms_norm(a, y, wn, 1e-6, xout_ref)
+        ref_n = (h @ w.t()).float()
+        tol = lambda r: 0.02 * r.abs().max().item() + 1e-3
+        for cfg in GEMV_CONFIGS:
+            out = Gemv(M, N, K, a.device, **cfg)(a, w).float()
+            assert (out - ref).abs().max().item() <= tol(ref), (M, cfg)
+            out = Gemv(M, I, K, a.device, gateup=True, **cfg)(a, wgu[:I], wgu[I:]).float()
+            assert (out - ref_gu).abs().max().item() <= tol(ref_gu), (M, cfg)
+            xout = torch.empty_like(a)
+            out = Gemv(M, N, K, a.device, **cfg)(a, w, norm=(y, wn, xout, 1e-6)).float()
+            assert torch.equal(xout, xout_ref) and (out - ref_n).abs().max().item() <= tol(ref_n), (M, cfg)
