@@ -429,7 +429,7 @@ class Engine:
         self.tau_floor_default = float(os.environ.get("ENGINE_TAU_FLOOR", "1.4"))
         # Tree nodes per sequence: each 64 query rows (16 nodes x 4 heads) that a
         # sequence's tree adds is another pass over its KV cache.
-        self.tree_rows_by_batch = {1: 64, 2: 32, 4: 16, 8: 8, 16: 4, 32: 4}
+        self.tree_rows_by_batch = {1: 64, 2: 32, 4: 16, 8: 8, 16: 8, 32: 4}
         # Tuning override (unset in a run): one row count for every batch size.
         self.tree_rows_env = int(os.environ.get("ENGINE_TREE_ROWS", "0"))
         self.self_check = os.environ.get("ENGINE_SELF_CHECK", "1") == "1"
