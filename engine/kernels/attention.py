@@ -176,19 +176,37 @@ ATTN_CONFIGS = [
 
 
 def _time(fn, iters: int = 30, rotate: list | None = None) -> float:
-    """Average ms per call; with ``rotate`` the argument cycles so no two
-    consecutive calls touch the same cache copy."""
+    """Average milliseconds per call, measured as a CUDA graph replay.
+
+    Host launch overhead exceeds the kernel time for many of these skinny
+    shapes, so a host-driven loop would report launch cost and favour whatever
+    launches fewest kernels. Capturing ``iters`` calls into one graph and
+    replaying it measures device time, which is how the deployed step runs.
+    With ``rotate``, call ``fn(w)`` over a cycle of distinct weight tensors so
+    consecutive iterations cannot be served from L2.
+    """
     ws = rotate or [None]
-    for i in range(3):
-        fn(ws[i % len(ws)]) if rotate else fn()
+    call = (lambda i: fn(ws[i % len(ws)])) if rotate else (lambda i: fn())
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for i in range(3):
+            call(i)
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for i in range(iters):
+            call(i)
+    graph.replay()
     torch.cuda.synchronize()
     start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     start.record()
-    for i in range(iters):
-        fn(ws[i % len(ws)]) if rotate else fn()
+    for _ in range(3):
+        graph.replay()
     end.record()
     torch.cuda.synchronize()
-    return start.elapsed_time(end) / iters
+    return start.elapsed_time(end) / (3 * iters)
 
 
 def reference_attention(q, k, v, pos, R: int, scale: float, tree: torch.Tensor | None = None) -> torch.Tensor:
