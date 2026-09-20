@@ -217,9 +217,10 @@ class Plan:
         self.model = model
         cfg = model.cfg
         self.B, self.T, self.max_new = B, T, max_new
-        # Capacity is padded so a sample asking for a few more tokens than the
-        # warmup did still fits without rebuilding graphs inside a timed run.
-        self.cap = ((T + max(max_new, 256) + 63) // 64) * 64
+        # Capacity covers the prompt, every output token, and a full draft block
+        # of up to 64 rows beyond the last committed slot, plus padding so a
+        # sample asking for a few more tokens than the warmup still fits.
+        self.cap = ((T + max(max_new, 256) + 2 * 64 + 63) // 64) * 64
         model.ensure_rope(self.cap)
         dev = model.device
         bf16 = torch.bfloat16

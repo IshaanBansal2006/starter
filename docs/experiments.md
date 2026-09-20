@@ -119,3 +119,24 @@ score: None  failure: incorrect_output The engine's tokens did not match native 
 | public-0 | passed | 336.8 | 5.90x | 0.55 | 0.16 |  |
 | public-1 | passed | 459.4 | 3.04x | 0.71 | 0.21 |  |
 | public-2 | passed | 2752.6 | 4.12x | 0.69 | 0.21 |  |
+
+## 2026-09-20 04:31 UTC — official run `9453d270-b697-4e50-afa5-2bb7d1f969dd` @ `51756fc` — succeeded
+
+commit 93201ec
+
+score: 985.5187265426272  failure:  
+
+| workload | status | tok/s | speedup | ttft ratio | tpot ratio | message |
+|---|---|---:|---:|---:|---:|---|
+| public-0 | passed | 332.0 | 12.03x | 0.27 | 0.08 |  |
+| public-1 | passed | 436.5 | 4.80x | 0.70 | 0.12 |  |
+| public-2 | passed | 2758.9 | 6.86x | 0.69 | 0.12 |  |
+
+## 2026-09-20 04:34 UTC — official run `cee14abd-9f47-4ca7-8fc2-a85a69db381b` @ `51756fc` — failed
+
+commit a0c2df9
+
+score: None  failure: candidate_error The model benchmark could not complete; detailed diagnostics are available to operators.
+
+| workload | status | tok/s | speedup | ttft ratio | tpot ratio | message |
+|---|---|---:|---:|---:|---:|---|
