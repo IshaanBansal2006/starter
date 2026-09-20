@@ -154,7 +154,7 @@ class Plan:
         self.v_cache = torch.zeros((cfg.layers, B, HKV, self.cap, D), dtype=bf16, device=dev)
         self.q_prefill = torch.empty((B, HQ, T, D), dtype=bf16, device=dev)
         self.q_decode = torch.empty((B, HQ, 1, D), dtype=bf16, device=dev)
-        self.attn_decode = torch.empty((B, HQ, D), dtype=bf16, device=dev)
+        self.attn_decode = torch.empty((B, 1, HQ, D), dtype=bf16, device=dev)
         log = lambda s: print(f"[engine] {s}", file=sys.stderr, flush=True)
         self.rope_fused = os.environ.get("ENGINE_ROPE_FUSED", "1") == "1"
         if os.environ.get("ENGINE_ATTN_DEFAULT") == "1":
@@ -229,7 +229,7 @@ class Plan:
             qkv = mm["qkv"](h, layer.wqkv)
             qk_norm_rope_cache(qkv, layer.q_norm, layer.k_norm, m.cos, m.sin, self.pos,
                                self.q_decode, self.k_cache[i], self.v_cache[i], 1, cfg.eps, fused=self.rope_fused)
-            self.attention(self.q_decode.view(B, HQ, D), self.k_cache[i], self.v_cache[i], self.pos, self.attn_decode)
+            self.attention(self.q_decode, self.k_cache[i], self.v_cache[i], self.pos, self.attn_decode)
             o = mm["o"](self.attn_decode.view(B, HQ * D), layer.wo)
             h2 = add_rms_norm(x, o, layer.post_norm, cfg.eps)
             d = mm["d"](mm["gu"](h2, layer.wgu), layer.wd)
@@ -237,3 +237,57 @@ class Plan:
         logits = mm["lm"](h, m.lm_head)
         self.pos.add_(1)
         return logits
+
+
+class VerifyPlan:
+    """Speculative verification: R = K + 1 query rows per sequence in one pass.
+
+    Row 0 holds the last accepted token, rows 1..K hold drafts. The forward
+    writes all R positions into the cache and returns the greedy token after
+    every row; the host accepts the longest prefix of drafts that the model
+    itself predicts, exactly as plain greedy decode would have produced it.
+    """
+
+    def __init__(self, plan: Plan, K: int):
+        self.plan, self.K, self.R = plan, K, K + 1
+        m, cfg, B = plan.model, plan.model.cfg, plan.B
+        dev, bf16 = m.device, torch.bfloat16
+        HQ, HKV, D = cfg.heads, cfg.kv_heads, cfg.head_dim
+        R = self.R
+        self.blk = torch.zeros((B, R), dtype=torch.int64, device=dev)
+        self.pos = torch.zeros((B,), dtype=torch.int32, device=dev)
+        self.q = torch.empty((B, HQ, R, D), dtype=bf16, device=dev)
+        self.attn_out = torch.empty((B, R, HQ, D), dtype=bf16, device=dev)
+        log = lambda s: print(f"[engine] {s}", file=sys.stderr, flush=True)
+        self.attention = pick_attention(B, HQ, HKV, D, plan.cap, plan.T + plan.max_new // 2, dev, log, R=R)
+        x = torch.randn((B * R, cfg.hidden), dtype=bf16, device=dev)
+        a = torch.randn((B * R, HQ * D), dtype=bf16, device=dev)
+        act = torch.randn((B * R, cfg.intermediate), dtype=bf16, device=dev)
+        self.mm = {
+            "qkv": pick_matmul(x, m.layers[0].wqkv, log),
+            "o": pick_matmul(a, m.layers[0].wo, log),
+            "gu": pick_gateup(x, m.layers[0].wgu, log),
+            "d": pick_matmul(act, m.layers[0].wd, log),
+            "lm": pick_matmul(x, m.lm_head, log),
+        }
+
+    @torch.inference_mode()
+    def verify(self) -> torch.Tensor:
+        """Consume ``blk`` at ``pos``; returns [B, R] greedy tokens, one per row."""
+        plan, mm = self.plan, self.mm
+        m, cfg = plan.model, plan.model.cfg
+        B, R = plan.B, self.R
+        HQ, D = cfg.heads, cfg.head_dim
+        x = F.embedding(self.blk.view(-1), m.embed)
+        h = rms_norm(x, m.layers[0].in_norm, cfg.eps)
+        for i, layer in enumerate(m.layers):
+            qkv = mm["qkv"](h, layer.wqkv)
+            qk_norm_rope_cache(qkv, layer.q_norm, layer.k_norm, m.cos, m.sin, self.pos,
+                               self.q, plan.k_cache[i], plan.v_cache[i], R, cfg.eps, fused=plan.rope_fused)
+            self.attention(self.q, plan.k_cache[i], plan.v_cache[i], self.pos, self.attn_out)
+            o = mm["o"](self.attn_out.view(B * R, HQ * D), layer.wo)
+            h2 = add_rms_norm(x, o, layer.post_norm, cfg.eps)
+            d = mm["d"](mm["gu"](h2, layer.wgu), layer.wd)
+            h = add_rms_norm(x, d, plan._next_norm(i), cfg.eps)
+        logits = mm["lm"](h, m.lm_head)
+        return logits.argmax(dim=-1).view(B, R)
