@@ -155,14 +155,17 @@ ATTN_CONFIGS = [
 ]
 
 
-def _time(fn, iters: int = 30) -> float:
-    for _ in range(3):
-        fn()
+def _time(fn, iters: int = 30, rotate: list | None = None) -> float:
+    """Average ms per call; with ``rotate`` the argument cycles so no two
+    consecutive calls touch the same cache copy."""
+    ws = rotate or [None]
+    for i in range(3):
+        fn(ws[i % len(ws)]) if rotate else fn()
     torch.cuda.synchronize()
     start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     start.record()
-    for _ in range(iters):
-        fn()
+    for i in range(iters):
+        fn(ws[i % len(ws)]) if rotate else fn()
     end.record()
     torch.cuda.synchronize()
     return start.elapsed_time(end) / iters
@@ -194,8 +197,13 @@ def pick_attention(B: int, HQ: int, HKV: int, D: int, cap: int, typical_len: int
     import torch.nn.functional as F
 
     q = torch.randn((B, HQ, R, D), dtype=torch.bfloat16, device=device)
-    k = torch.randn((B, HKV, cap, D), dtype=torch.bfloat16, device=device)
-    v = torch.randn((B, HKV, cap, D), dtype=torch.bfloat16, device=device)
+    # Enough distinct cache copies that a timing loop cannot be served from L2
+    # (the decode step reads every layer's cache once per token).
+    one = B * HKV * cap * D * 2 * 2
+    copies = max(1, min(36, (192 << 20) // one + 1))
+    ks = [torch.randn((B, HKV, cap, D), dtype=torch.bfloat16, device=device) for _ in range(copies)]
+    vs = [torch.randn((B, HKV, cap, D), dtype=torch.bfloat16, device=device) for _ in range(copies)]
+    k, v = ks[0], vs[0]
     pos = torch.full((B,), typical_len - R, dtype=torch.int32, device=device)
     out = torch.empty((B, R, HQ, D), dtype=torch.bfloat16, device=device)
     L = typical_len
@@ -216,7 +224,7 @@ def pick_attention(B: int, HQ: int, HKV: int, D: int, cap: int, typical_len: int
                     if log:
                         log(f"attention {cfg} nsplit={nsplit} rejected: err {err:.4g}")
                     continue
-                ms = _time(lambda: attn(q, k, v, pos, out))
+                ms = _time(lambda i: attn(q, ks[i], vs[i], pos, out), rotate=list(range(copies)))
             except Exception as exc:
                 if log:
                     log(f"attention {cfg} nsplit={nsplit} failed: {exc}")
@@ -227,6 +235,7 @@ def pick_attention(B: int, HQ: int, HKV: int, D: int, cap: int, typical_len: int
         if log:
             log("no Triton decode attention configuration works here; using the torch fallback")
         return TorchDecodeAttention(B, HQ, HKV, D, cap, R, device)
+    del ks, vs
     if log:
         kv_bytes = 2 * B * HKV * L * D * 2
         log(f"attention B={B} R={R} len={L}: {best_name} {best_ms * 1000:.1f}us ({kv_bytes / best_ms / 1e6:.0f} GB/s)")

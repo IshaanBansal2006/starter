@@ -350,30 +350,37 @@ CONFIGS = [
 ]
 
 
-def _time(fn, iters: int = 30) -> float:
-    for _ in range(3):
-        fn()
+def _time(fn, iters: int = 30, rotate: list | None = None) -> float:
+    """Average milliseconds per call. With ``rotate``, call ``fn(w)`` over a
+    cycle of distinct weight tensors so consecutive iterations cannot be served
+    from L2: the decode step streams every layer's weights once per token, and
+    a kernel that only looks fast on a cache-resident matrix must not win."""
+    ws = rotate or [None]
+    for i in range(3):
+        fn(ws[i % len(ws)]) if rotate else fn()
     torch.cuda.synchronize()
     start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     start.record()
-    for _ in range(iters):
-        fn()
+    for i in range(iters):
+        fn(ws[i % len(ws)]) if rotate else fn()
     end.record()
     torch.cuda.synchronize()
     return start.elapsed_time(end) / iters
 
 
-def pick_matmul(a: torch.Tensor, w: torch.Tensor, log=None):
+def pick_matmul(a: torch.Tensor, w: torch.Tensor, log=None, ws: list | None = None):
     """Return the fastest callable ``f(a, w) -> a @ w.T`` for this exact shape.
 
     Candidates: cuBLAS via ``torch.matmul`` and each Triton config whose
     output matches cuBLAS to bf16 rounding. Measured on the device the run
-    will use, at warmup, so the choice reflects the real hardware.
+    will use, at warmup, rotating over ``ws`` (every layer's copy of this
+    weight) so the timing reflects HBM streaming rather than L2 hits.
     """
     M, K = a.shape
     N = w.shape[0]
+    rot = ws or [w]
     cublas = lambda a, w: a @ w.t()
-    best_name, best_ms, best = "cublas", _time(lambda: cublas(a, w)), cublas
+    best_name, best_ms, best = "cublas", _time(lambda w: cublas(a, w), rotate=rot), cublas
     ref = cublas(a, w).float()
     candidates = []
     if M <= 32:
@@ -392,7 +399,7 @@ def pick_matmul(a: torch.Tensor, w: torch.Tensor, log=None):
                 if log:
                     log(f"{name} {cfg} rejected: err {err:.4g} > {tol:.4g}")
                 continue
-            ms = _time(lambda: mm(a, w))
+            ms = _time(lambda w: mm(a, w), rotate=rot)
         except Exception as exc:  # a config that will not compile on this device is simply not used
             if log:
                 log(f"{name} {cfg} failed: {exc}")
@@ -405,15 +412,16 @@ def pick_matmul(a: torch.Tensor, w: torch.Tensor, log=None):
     return best
 
 
-def pick_gateup(a: torch.Tensor, wgu: torch.Tensor, log=None):
+def pick_gateup(a: torch.Tensor, wgu: torch.Tensor, log=None, ws: list | None = None):
     """Fastest ``f(a, wgu) -> swiglu(a @ wgu.T)``: cuBLAS + SwiGLU kernel, or the fused Triton GEMM."""
     from kernels.swiglu import swiglu
 
     M, K = a.shape
     I = wgu.shape[0] // 2
     wg, wu = wgu[:I], wgu[I:]
+    rot = ws or [wgu]
     cublas = lambda a, wgu: swiglu(a @ wgu.t())
-    best_name, best_ms, best = "cublas+swiglu", _time(lambda: cublas(a, wgu)), cublas
+    best_name, best_ms, best = "cublas+swiglu", _time(lambda w: cublas(a, w), rotate=rot), cublas
     ref = cublas(a, wgu).float()
     candidates = []
     if M <= 32:
@@ -432,7 +440,7 @@ def pick_gateup(a: torch.Tensor, wgu: torch.Tensor, log=None):
                 if log:
                     log(f"{name} {cfg} rejected: err {err:.4g} > {tol:.4g}")
                 continue
-            ms = _time(lambda: mm(a, wg, wu))
+            ms = _time(lambda w: mm(a, w[:I], w[I:]), rotate=rot)
         except Exception as exc:
             if log:
                 log(f"{name} {cfg} failed: {exc}")
@@ -444,7 +452,7 @@ def pick_gateup(a: torch.Tensor, wgu: torch.Tensor, log=None):
     return best
 
 
-def pick_normed(kind: str, x: torch.Tensor, y: torch.Tensor, w_norm: torch.Tensor, w: torch.Tensor, eps: float, log=None):
+def pick_normed(kind: str, x: torch.Tensor, y: torch.Tensor, w_norm: torch.Tensor, w: torch.Tensor, eps: float, log=None, ws: list | None = None):
     """Fastest ``f(x, y, w_norm, xout, w) -> proj(rms_norm(x + y))`` that also writes ``xout = x + y``.
 
     ``kind`` is "matmul" or "gateup". The unfused pipeline (add_rms_norm
@@ -455,10 +463,11 @@ def pick_normed(kind: str, x: torch.Tensor, y: torch.Tensor, w_norm: torch.Tenso
 
     M, K = x.shape
     xout = torch.empty_like(x)
+    rot = ws or [w]
     picker = pick_matmul if kind == "matmul" else pick_gateup
-    plain = picker(x, w, None)
+    plain = picker(x, w, None, ws=rot)
     unfused = lambda x, y, w_norm, xout, w: plain(add_rms_norm(x, y, w_norm, eps, xout), w)
-    best_name, best_ms, best = "add_norm+" + kind, _time(lambda: unfused(x, y, w_norm, xout, w)), unfused
+    best_name, best_ms, best = "add_norm+" + kind, _time(lambda w: unfused(x, y, w_norm, xout, w), rotate=rot), unfused
     ref = unfused(x, y, w_norm, xout, w).float()
     ref_xout = xout.clone()
     I = w.shape[0] // 2
@@ -490,7 +499,7 @@ def pick_normed(kind: str, x: torch.Tensor, y: torch.Tensor, w_norm: torch.Tenso
                     if log:
                         log(f"normed {name} {cfg} rejected: err {err:.4g}")
                     continue
-                ms = _time(lambda: fused(x, y, w_norm, xout, w))
+                ms = _time(lambda w: fused(x, y, w_norm, xout, w), rotate=rot)
             except Exception as exc:
                 if log:
                     log(f"normed {name} {cfg} failed: {exc}")
