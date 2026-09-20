@@ -15,6 +15,8 @@ import torch
 import triton
 import triton.language as tl
 
+import budget
+
 
 @triton.jit
 def _norm_stats(x_ptr, y_ptr, xout_ptr, M, K, stride_am, eps, write_out,
@@ -272,9 +274,7 @@ class Gemv:
 
 GEMV_CONFIGS = [
     dict(block_n=32, block_k=256, split_k=1, num_warps=4, num_stages=3),
-    dict(block_n=16, block_k=512, split_k=1, num_warps=4, num_stages=3),
     dict(block_n=32, block_k=256, split_k=4, num_warps=4, num_stages=3),
-    dict(block_n=64, block_k=128, split_k=4, num_warps=4, num_stages=3),
     dict(block_n=16, block_k=256, split_k=8, num_warps=2, num_stages=3),
 ]
 
@@ -381,6 +381,8 @@ def pick_matmul(a: torch.Tensor, w: torch.Tensor, log=None):
     if M == 1:
         candidates += [("gemv", cfg, lambda cfg=cfg: Gemv(M, N, K, a.device, **cfg)) for cfg in GEMV_CONFIGS]
     for name, cfg, build in candidates:
+        if budget.expired():
+            break
         try:
             mm = build()
             out = mm(a, w).float()
@@ -419,6 +421,8 @@ def pick_gateup(a: torch.Tensor, wgu: torch.Tensor, log=None):
     if M == 1:
         candidates += [("gemv-gateup", cfg, lambda cfg=cfg: Gemv(M, I, K, a.device, gateup=True, **cfg)) for cfg in GEMV_CONFIGS]
     for name, cfg, build in candidates:
+        if budget.expired():
+            break
         try:
             mm = build()
             out = mm(a, wg, wu).float()
@@ -476,6 +480,8 @@ def pick_normed(kind: str, x: torch.Tensor, y: torch.Tensor, w_norm: torch.Tenso
                 candidates.append(("gemv-gateup", cfg, lambda cfg=cfg: Gemv(M, I, K, x.device, gateup=True, **cfg),
                                    lambda mm: (lambda x, y, w_norm, xout, w: mm(x, w[:I], w[I:], norm=(y, w_norm, xout, eps)))))
     for name, cfg, build, wrap in candidates:
+            if budget.expired():
+                break
             try:
                 fused = wrap(build())
                 out = fused(x, y, w_norm, xout, w).float()

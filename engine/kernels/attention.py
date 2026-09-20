@@ -17,6 +17,8 @@ import torch
 import triton
 import triton.language as tl
 
+import budget
+
 
 @triton.jit
 def _split_kernel(
@@ -204,6 +206,8 @@ def pick_attention(B: int, HQ: int, HKV: int, D: int, cap: int, typical_len: int
     best, best_ms, best_name = None, float("inf"), ""
     for cfg in ATTN_CONFIGS:
         for nsplit in splits:
+            if budget.expired() and best is not None:
+                break
             try:
                 attn = DecodeAttention(B, HQ, HKV, D, cap, device, nsplit=nsplit, R=R, **cfg)
                 attn(q, k, v, pos, out)
