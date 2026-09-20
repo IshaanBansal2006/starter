@@ -1,0 +1,141 @@
+"""Skinny GEMM for decode: ``C[M, N] = A[M, K] @ W[N, K]^T`` with M <= 32.
+
+At decode the projections are pure weight streaming, so the kernel is built
+to keep every SM reading: each program owns ``BLOCK_N`` rows of ``W`` and one
+``K`` slice (split-K), accumulates in fp32 with tensor-core ``tl.dot`` over a
+zero-padded 16-row ``A`` tile, and writes fp32 partials that a second kernel
+sums and rounds to bf16. With ``SPLIT_K == 1`` the first kernel rounds and
+stores directly. Whether this beats cuBLAS is measured per shape at warmup
+(``pick_matmul``), never assumed.
+"""
+
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _skinny_kernel(
+    a_ptr, w_ptr, c_ptr, part_ptr,
+    M, N, K, stride_am, stride_wn, k_per_split,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, SPLIT_K: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    rm = tl.arange(0, BLOCK_M)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    rk = tl.arange(0, BLOCK_K)
+    m_mask = rm < M
+    n_mask = rn < N
+    k_start = pid_k * k_per_split
+    k_end = tl.minimum(k_start + k_per_split, K)
+    acc = tl.zeros([BLOCK_M, BLOCK_N], tl.float32)
+    for k0 in range(k_start, k_end, BLOCK_K):
+        kk = k0 + rk
+        k_mask = kk < k_end
+        a = tl.load(a_ptr + rm[:, None] * stride_am + kk[None, :], mask=m_mask[:, None] & k_mask[None, :], other=0.0)
+        w = tl.load(w_ptr + rn[:, None] * stride_wn + kk[None, :], mask=n_mask[:, None] & k_mask[None, :], other=0.0)
+        acc += tl.dot(a, tl.trans(w))
+    if SPLIT_K == 1:
+        tl.store(c_ptr + rm[:, None] * N + rn[None, :], acc.to(tl.bfloat16), mask=m_mask[:, None] & n_mask[None, :])
+    else:
+        tl.store(part_ptr + (pid_k * M + rm[:, None]) * N + rn[None, :], acc, mask=m_mask[:, None] & n_mask[None, :])
+
+
+@triton.jit
+def _sum_kernel(part_ptr, c_ptr, MN, SPLIT_K: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    idx = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = idx < MN
+    acc = tl.zeros([BLOCK], tl.float32)
+    for s in range(SPLIT_K):
+        acc += tl.load(part_ptr + s * MN + idx, mask=mask, other=0.0)
+    tl.store(c_ptr + idx, acc.to(tl.bfloat16), mask=mask)
+
+
+class SkinnyMatmul:
+    def __init__(self, M: int, N: int, K: int, device, block_n: int, block_k: int, split_k: int, num_warps: int, num_stages: int):
+        self.M, self.N, self.K = M, N, K
+        self.BLOCK_M = 16 if M <= 16 else 32
+        self.BLOCK_N, self.BLOCK_K, self.SPLIT_K = block_n, block_k, split_k
+        self.num_warps, self.num_stages = num_warps, num_stages
+        self.k_per_split = triton.cdiv(triton.cdiv(K, split_k), block_k) * block_k
+        self.SPLIT_K = triton.cdiv(K, self.k_per_split)
+        self.part = torch.empty((self.SPLIT_K, M, N), dtype=torch.float32, device=device) if self.SPLIT_K > 1 else None
+        self.grid = (triton.cdiv(N, block_n), self.SPLIT_K)
+
+    def __call__(self, a: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        c = torch.empty((self.M, self.N), dtype=torch.bfloat16, device=a.device)
+        _skinny_kernel[self.grid](
+            a, w, c, self.part if self.part is not None else c,
+            self.M, self.N, self.K, a.stride(0), w.stride(0), self.k_per_split,
+            BLOCK_M=self.BLOCK_M, BLOCK_N=self.BLOCK_N, BLOCK_K=self.BLOCK_K, SPLIT_K=self.SPLIT_K,
+            num_warps=self.num_warps, num_stages=self.num_stages,
+        )
+        if self.SPLIT_K > 1:
+            MN = self.M * self.N
+            _sum_kernel[(triton.cdiv(MN, 1024),)](self.part, c, MN, SPLIT_K=self.SPLIT_K, BLOCK=1024, num_warps=4)
+        return c
+
+
+CONFIGS = [
+    dict(block_n=64, block_k=128, split_k=1, num_warps=4, num_stages=3),
+    dict(block_n=32, block_k=128, split_k=1, num_warps=4, num_stages=3),
+    dict(block_n=64, block_k=64, split_k=4, num_warps=4, num_stages=4),
+    dict(block_n=32, block_k=128, split_k=4, num_warps=4, num_stages=3),
+    dict(block_n=64, block_k=128, split_k=8, num_warps=4, num_stages=3),
+    dict(block_n=128, block_k=64, split_k=4, num_warps=8, num_stages=3),
+    dict(block_n=16, block_k=256, split_k=2, num_warps=4, num_stages=3),
+    dict(block_n=32, block_k=64, split_k=8, num_warps=4, num_stages=4),
+]
+
+
+def _time(fn, iters: int = 30) -> float:
+    for _ in range(3):
+        fn()
+    torch.cuda.synchronize()
+    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        fn()
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) / iters
+
+
+def pick_matmul(a: torch.Tensor, w: torch.Tensor, log=None):
+    """Return the fastest callable ``f(a, w) -> a @ w.T`` for this exact shape.
+
+    Candidates: cuBLAS via ``torch.matmul`` and each Triton config whose
+    output matches cuBLAS to bf16 rounding. Measured on the device the run
+    will use, at warmup, so the choice reflects the real hardware.
+    """
+    M, K = a.shape
+    N = w.shape[0]
+    cublas = lambda a, w: a @ w.t()
+    best_name, best_ms, best = "cublas", _time(lambda: cublas(a, w)), cublas
+    ref = cublas(a, w).float()
+    if M <= 32:
+        for cfg in CONFIGS:
+            try:
+                mm = SkinnyMatmul(M, N, K, a.device, **cfg)
+                out = mm(a, w).float()
+                err = (out - ref).abs().max().item()
+                tol = 0.02 * ref.abs().max().item() + 1e-3
+                if err > tol:
+                    if log:
+                        log(f"skinny {cfg} rejected: err {err:.4g} > {tol:.4g}")
+                    continue
+                ms = _time(lambda: mm(a, w))
+            except Exception as exc:  # a config that will not compile on this device is simply not used
+                if log:
+                    log(f"skinny {cfg} failed: {exc}")
+                continue
+            if ms < best_ms:
+                best_name, best_ms, best = f"triton{cfg}", ms, mm
+    if log:
+        log(f"matmul M={M} N={N} K={K}: {best_name} {best_ms * 1000:.1f}us "
+            f"({2 * M * N * K / best_ms / 1e6:.0f} GFLOP/s, {N * K * 2 / best_ms / 1e6:.0f} GB/s)")
+    return best

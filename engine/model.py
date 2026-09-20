@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,7 +17,7 @@ import torch
 import torch.nn.functional as F
 from safetensors import safe_open
 
-from kernels import DecodeAttention, qk_norm_rope_cache, rms_norm, swiglu
+from kernels import DecodeAttention, add_rms_norm, pick_matmul, qk_norm_rope_cache, rms_norm, swiglu
 
 
 @dataclass(frozen=True)
@@ -152,18 +153,27 @@ class Plan:
         self.q_decode = torch.empty((B, HQ, 1, D), dtype=bf16, device=dev)
         self.attn_decode = torch.empty((B, HQ, D), dtype=bf16, device=dev)
         self.attention = DecodeAttention(B, HQ, HKV, D, self.cap, dev)
+        self.mm = self._pick_decode_matmuls()
 
-    def _layer_common(self, x: torch.Tensor, layer: Layer, attn_flat: torch.Tensor) -> torch.Tensor:
-        cfg = self.model.cfg
-        x = x + attn_flat @ layer.wo.t()
-        h2 = rms_norm(x, layer.post_norm, cfg.eps)
-        act = swiglu(h2 @ layer.wgu.t())
-        return x + act @ layer.wd.t()
+    def _pick_decode_matmuls(self) -> dict[str, object]:
+        """Time cuBLAS against the Triton skinny GEMM for every decode shape."""
+        m, cfg, B = self.model, self.model.cfg, self.B
+        layer = m.layers[0]
+        x = torch.randn((B, cfg.hidden), dtype=torch.bfloat16, device=m.device)
+        a = torch.randn((B, cfg.heads * cfg.head_dim), dtype=torch.bfloat16, device=m.device)
+        act = torch.randn((B, cfg.intermediate), dtype=torch.bfloat16, device=m.device)
+        log = lambda s: print(f"[engine] {s}", file=sys.stderr, flush=True)
+        return {
+            "qkv": pick_matmul(x, layer.wqkv, log),
+            "o": pick_matmul(a, layer.wo, log),
+            "gu": pick_matmul(x, layer.wgu, log),
+            "d": pick_matmul(act, layer.wd, log),
+            "lm": pick_matmul(x, m.lm_head, log),
+        }
 
-    def _logits(self, x_last: torch.Tensor) -> torch.Tensor:
-        cfg = self.model.cfg
-        hn = rms_norm(x_last, self.model.final_norm, cfg.eps)
-        return hn @ self.model.lm_head.t()
+    def _next_norm(self, i: int) -> torch.Tensor:
+        layers = self.model.layers
+        return layers[i + 1].in_norm if i + 1 < len(layers) else self.model.final_norm
 
     @torch.inference_mode()
     def prefill(self) -> torch.Tensor:
@@ -173,8 +183,8 @@ class Plan:
         HQ, D = cfg.heads, cfg.head_dim
         self.pos.zero_()
         x = F.embedding(self.ids.view(-1), m.embed)
+        h = rms_norm(x, m.layers[0].in_norm, cfg.eps)
         for i, layer in enumerate(m.layers):
-            h = rms_norm(x, layer.in_norm, cfg.eps)
             qkv = h @ layer.wqkv.t()
             qk_norm_rope_cache(qkv, layer.q_norm, layer.k_norm, m.cos, m.sin, self.pos,
                                self.q_prefill, self.k_cache[i], self.v_cache[i], T, cfg.eps)
@@ -182,8 +192,11 @@ class Plan:
                 self.q_prefill, self.k_cache[i, :, :, :T], self.v_cache[i, :, :, :T],
                 is_causal=True, scale=m.scale, enable_gqa=True,
             )
-            x = self._layer_common(x, layer, a.transpose(1, 2).reshape(B * T, HQ * D))
-        logits = self._logits(x.view(B, T, cfg.hidden)[:, -1])
+            o = a.transpose(1, 2).reshape(B * T, HQ * D) @ layer.wo.t()
+            h2 = add_rms_norm(x, o, layer.post_norm, cfg.eps)
+            d = swiglu(h2 @ layer.wgu.t()) @ layer.wd.t()
+            h = add_rms_norm(x, d, self._next_norm(i), cfg.eps)
+        logits = h.view(B, T, cfg.hidden)[:, -1] @ m.lm_head.t()
         self.pos.fill_(T)
         return logits
 
@@ -193,14 +206,18 @@ class Plan:
         m, cfg = self.model, self.model.cfg
         B = self.B
         HQ, D = cfg.heads, cfg.head_dim
+        mm = self.mm
         x = F.embedding(self.tok, m.embed)
+        h = rms_norm(x, m.layers[0].in_norm, cfg.eps)
         for i, layer in enumerate(m.layers):
-            h = rms_norm(x, layer.in_norm, cfg.eps)
-            qkv = h @ layer.wqkv.t()
+            qkv = mm["qkv"](h, layer.wqkv)
             qk_norm_rope_cache(qkv, layer.q_norm, layer.k_norm, m.cos, m.sin, self.pos,
                                self.q_decode, self.k_cache[i], self.v_cache[i], 1, cfg.eps)
             self.attention(self.q_decode.view(B, HQ, D), self.k_cache[i], self.v_cache[i], self.pos, self.attn_decode)
-            x = self._layer_common(x, layer, self.attn_decode.view(B, HQ * D))
-        logits = self._logits(x)
+            o = mm["o"](self.attn_decode.view(B, HQ * D), layer.wo)
+            h2 = add_rms_norm(x, o, layer.post_norm, cfg.eps)
+            d = mm["d"](swiglu(mm["gu"](h2, layer.wgu)), layer.wd)
+            h = add_rms_norm(x, d, self._next_norm(i), cfg.eps)
+        logits = mm["lm"](h, m.lm_head)
         self.pos.add_(1)
         return logits

@@ -20,10 +20,11 @@ import triton.language as tl
 
 @triton.jit
 def _split_kernel(
-    q_ptr, k_ptr, v_ptr, pos_ptr, o_part_ptr, m_part_ptr, l_part_ptr,
+    q_ptr, k_ptr, v_ptr, pos_ptr, o_part_ptr, m_part_ptr, l_part_ptr, o_ptr,
     CAP, scale,
     HQ: tl.constexpr, HKV: tl.constexpr, G: tl.constexpr, GP: tl.constexpr,
     D: tl.constexpr, BLOCK_N: tl.constexpr, NSPLIT: tl.constexpr, SPLIT_LEN: tl.constexpr,
+    FINAL: tl.constexpr,
 ):
     b = tl.program_id(0)
     kh = tl.program_id(1)
@@ -59,10 +60,14 @@ def _split_kernel(
         m = m_new
 
     head = kh * G + rows
-    part = (b * HQ + head) * NSPLIT + s
-    tl.store(o_part_ptr + part[:, None] * D + d[None, :], acc, mask=row_mask[:, None])
-    tl.store(m_part_ptr + part, m, mask=row_mask)
-    tl.store(l_part_ptr + part, l, mask=row_mask)
+    if FINAL:
+        out = acc / l[:, None]
+        tl.store(o_ptr + (b * HQ + head[:, None]) * D + d[None, :], out.to(tl.bfloat16), mask=row_mask[:, None])
+    else:
+        part = (b * HQ + head) * NSPLIT + s
+        tl.store(o_part_ptr + part[:, None] * D + d[None, :], acc, mask=row_mask[:, None])
+        tl.store(m_part_ptr + part, m, mask=row_mask)
+        tl.store(l_part_ptr + part, l, mask=row_mask)
 
 
 @triton.jit
@@ -109,12 +114,15 @@ class DecodeAttention:
     def __call__(self, q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, pos: torch.Tensor, out: torch.Tensor) -> None:
         """q [B, HQ, D] bf16; k/v_cache [B, HKV, cap, D]; pos [B] int32; out [B, HQ, D] bf16."""
         _split_kernel[(self.B, self.HKV, self.NSPLIT)](
-            q, k_cache, v_cache, pos, self.o_part, self.m_part, self.l_part,
+            q, k_cache, v_cache, pos, self.o_part, self.m_part, self.l_part, out,
             self.cap, self.scale,
             HQ=self.HQ, HKV=self.HKV, G=self.G, GP=self.GP, D=self.D,
             BLOCK_N=self.BLOCK_N, NSPLIT=self.NSPLIT, SPLIT_LEN=self.SPLIT_LEN,
+            FINAL=self.NSPLIT == 1,
             num_warps=4, num_stages=2,
         )
+        if self.NSPLIT == 1:
+            return
         _reduce_kernel[(self.B, self.HQ)](
             self.o_part, self.m_part, self.l_part, out,
             HQ=self.HQ, D=self.D, NSPLIT=self.NSPLIT, NSP=self.NSP, num_warps=1,
