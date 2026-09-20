@@ -370,5 +370,5 @@ class VerifyPlan:
         depth = self.recycler.depth if self.recycler is not None else None
         logits = run_layers(plan, self.mm, x, self.q, self.attn_out, attention, self.pos, R, plan.rope_fused, depth=depth)
         if self.recycler is not None:
-            self.recycler.update(self.blk.view(-1), logits)
+            return self.recycler.update(self.blk.view(-1), logits).view(B, R)
         return logits.argmax(dim=-1).view(B, R)

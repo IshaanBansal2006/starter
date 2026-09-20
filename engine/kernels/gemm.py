@@ -297,6 +297,12 @@ GEMV_CONFIGS = [
 ]
 
 
+def _block_m(M: int) -> int:
+    """One M tile whenever M <= 128 so the weights stream exactly once; a 32-row
+    tile walked several times would re-read every weight matrix per tile."""
+    return max(16, min(128, triton.next_power_of_2(M)))
+
+
 def _sm_count(device) -> int:
     try:
         return torch.cuda.get_device_properties(device).multi_processor_count
@@ -310,7 +316,7 @@ class SkinnyGateUp:
     def __init__(self, M: int, N: int, K: int, device, block_n: int, block_k: int, split_k: int, num_warps: int,
                  num_stages: int, persist: int = 0):
         self.M, self.N, self.K = M, N, K
-        self.BLOCK_M = 16 if M <= 16 else 32
+        self.BLOCK_M = _block_m(M)
         self.BLOCK_N, self.BLOCK_K = block_n, block_k
         self.num_warps, self.num_stages = num_warps, num_stages
         self.k_per_split = triton.cdiv(triton.cdiv(K, split_k), block_k) * block_k
@@ -342,7 +348,7 @@ class SkinnyMatmul:
     def __init__(self, M: int, N: int, K: int, device, block_n: int, block_k: int, split_k: int, num_warps: int,
                  num_stages: int, persist: int = 0):
         self.M, self.N, self.K = M, N, K
-        self.BLOCK_M = 16 if M <= 16 else 32
+        self.BLOCK_M = _block_m(M)
         self.BLOCK_N, self.BLOCK_K, self.SPLIT_K = block_n, block_k, split_k
         self.num_warps, self.num_stages = num_warps, num_stages
         self.k_per_split = triton.cdiv(triton.cdiv(K, split_k), block_k) * block_k
@@ -382,6 +388,58 @@ CONFIGS = [
     dict(block_n=64, block_k=128, split_k=4, num_warps=4, num_stages=4, persist=2),
     dict(block_n=32, block_k=128, split_k=4, num_warps=4, num_stages=3, persist=2),
 ]
+
+
+WIDE_CONFIGS = [
+    dict(block_n=64, block_k=64, split_k=1, num_warps=8, num_stages=3, persist=1),
+    dict(block_n=32, block_k=64, split_k=2, num_warps=8, num_stages=3, persist=2),
+    dict(block_n=64, block_k=128, split_k=1, num_warps=8, num_stages=2),
+    dict(block_n=32, block_k=128, split_k=1, num_warps=4, num_stages=3),
+]
+
+
+def _configs_for(M: int) -> list:
+    """Narrow tiles (M <= 32) reuse CONFIGS; wide tiles need fewer registers per row."""
+    return CONFIGS if M <= 32 else WIDE_CONFIGS
+
+
+_PROBED: dict = {}
+
+
+def _probe_wide(kind: str, M: int, N: int, K: int, cfg: dict, log=None) -> bool:
+    """Run a wide-tile (M >= 64) kernel once in a subprocess before using it here.
+
+    Wide tiles take a different code path on Hopper (wgmma) that this project
+    cannot exercise locally; an illegal access there is a sticky CUDA error that
+    would end the run, so it is tried where a crash costs nothing.
+    """
+    import subprocess, sys, json
+    key = (kind, _block_m(M), json.dumps(cfg, sort_keys=True))
+    if key in _PROBED:
+        return _PROBED[key]
+    code = (
+        "import sys, torch; sys.path.insert(0, %r)\n"
+        "from kernels.gemm import SkinnyMatmul, SkinnyGateUp\n"
+        "M,N,K=%d,%d,%d; cfg=%s; kind=%r\n"
+        "a=torch.randn(M,K,device='cuda',dtype=torch.bfloat16); w=torch.randn(N if kind!='gateup' else 2*N,K,device='cuda',dtype=torch.bfloat16)*0.02\n"
+        "y=torch.randn(M,K,device='cuda',dtype=torch.bfloat16); wn=torch.ones(K,device='cuda',dtype=torch.bfloat16); xo=torch.empty_like(a)\n"
+        "for norm in (None,(y,wn,xo,1e-6)):\n"
+        "    if kind=='gateup': out=SkinnyGateUp(M,N,K,a.device,**cfg)(a,w[:N],w[N:],norm=norm)\n"
+        "    else: out=SkinnyMatmul(M,N,K,a.device,**cfg)(a,w,norm=norm)\n"
+        "    torch.cuda.synchronize(); assert torch.isfinite(out.float()).all()\n"
+        "print('ok')\n"
+    ) % (str(__import__('pathlib').Path(__file__).resolve().parents[1]), M, N, K, json.dumps(cfg), kind)
+    try:
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
+        ok = r.returncode == 0 and "ok" in r.stdout
+        if not ok and log:
+            log(f"wide probe {kind} M={M} {cfg} failed: rc={r.returncode} {r.stderr.strip().splitlines()[-1:] }")
+    except Exception as exc:
+        ok = False
+        if log:
+            log(f"wide probe {kind} M={M} {cfg} error: {exc!r}")
+    _PROBED[key] = ok
+    return ok
 
 
 def _time(fn, iters: int = 30, rotate: list | None = None) -> float:
@@ -434,7 +492,8 @@ def pick_matmul(a: torch.Tensor, w: torch.Tensor, log=None, ws: list | None = No
     ref = cublas(a, w).float()
     candidates = []
     if M <= 128:
-        candidates += [("skinny", cfg, lambda cfg=cfg: SkinnyMatmul(M, N, K, a.device, **cfg)) for cfg in CONFIGS]
+        candidates += [("skinny", cfg, lambda cfg=cfg: SkinnyMatmul(M, N, K, a.device, **cfg))
+                       for cfg in _configs_for(M) if M <= 32 or _probe_wide("matmul", M, N, K, cfg, log)]
     if M == 1:
         candidates += [("gemv", cfg, lambda cfg=cfg: Gemv(M, N, K, a.device, **cfg)) for cfg in GEMV_CONFIGS]
     for name, cfg, build in candidates:
@@ -475,7 +534,8 @@ def pick_gateup(a: torch.Tensor, wgu: torch.Tensor, log=None, ws: list | None = 
     ref = cublas(a, wgu).float()
     candidates = []
     if M <= 128:
-        candidates += [("gateup", cfg, lambda cfg=cfg: SkinnyGateUp(M, I, K, a.device, **cfg)) for cfg in CONFIGS]
+        candidates += [("gateup", cfg, lambda cfg=cfg: SkinnyGateUp(M, I, K, a.device, **cfg))
+                       for cfg in _configs_for(M) if M <= 32 or _probe_wide("gateup", M, I, K, cfg, log)]
     if M == 1:
         candidates += [("gemv-gateup", cfg, lambda cfg=cfg: Gemv(M, I, K, a.device, gateup=True, **cfg)) for cfg in GEMV_CONFIGS]
     for name, cfg, build in candidates:
@@ -523,7 +583,9 @@ def pick_normed(kind: str, x: torch.Tensor, y: torch.Tensor, w_norm: torch.Tenso
     I = w.shape[0] // 2
     candidates = []
     if M <= 128:
-        for cfg in CONFIGS:
+        for cfg in _configs_for(M):
+            if M > 32 and not _probe_wide(kind, M, w.shape[0] if kind == "matmul" else I, K, cfg, log):
+                continue
             if kind == "matmul":
                 candidates.append(("skinny", cfg, lambda cfg=cfg: SkinnyMatmul(M, w.shape[0], K, x.device, **cfg),
                                    lambda mm: (lambda x, y, w_norm, xout, w: mm(x, w, norm=(y, w_norm, xout, eps)))))
