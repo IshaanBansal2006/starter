@@ -166,7 +166,10 @@ class Recycler:
         need no second pass over the logits. The row maxima land in ``row_max``."""
         vals, top = fast_topk(logits, self.k)
         self.table.index_copy_(0, tokens, top)
-        self.row_max = vals[:, 0]
+        # Copy, never rebind: the accept kernel indexes row_max as a contiguous
+        # [B*R] vector, and vals[:, 0] is a strided view (stride k).
+        if vals.shape[0] == self.row_max.shape[0]:  # verify rows; the prompt warm start has other sizes
+            self.row_max.copy_(vals[:, 0])
         return top[:, 0].to(torch.int64)
 
     def child_logits(self, logits: torch.Tensor) -> torch.Tensor:

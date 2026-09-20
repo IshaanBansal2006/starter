@@ -516,26 +516,33 @@ class Engine:
         torch.cuda.empty_cache()
 
     def _check_recycle(self, plan: GraphPlan, ref, input_ids: list[list[int]], steps: int = 12) -> None:
-        """Run the speculative loop on the warmup prompt and judge every emitted
-        token against the reference on our own prefix; on failure the plan
-        drops to plain decode, which the first self-check already validated."""
+        """Run the speculative loop on the warmup prompt and check every emitted
+        token against the plain decode path's own logits on that prefix (the
+        plain path is what the reference comparison validated). A speculative
+        token more than one logit below the plain argmax means the tree path is
+        wrong for this shape, and the plan drops to plain decode."""
         t0 = time.perf_counter()
         B = len(input_ids)
+        p = plan.plan
         try:
             out = list(plan.run(input_ids, steps))
-            seq = torch.tensor(input_ids, dtype=torch.int64, device=self.model.device)
+            ok = len(out) == steps and all(len(t) == B for t in out)
             worst = 0.0
-            for toks in out:
-                logits = ref.logits(seq)
-                top = logits.max(dim=-1).values
-                mine = logits.gather(1, torch.tensor(toks, device=logits.device)[:, None])[:, 0]
-                worst = max(worst, (top - mine).max().item())
-                seq = torch.cat([seq, torch.tensor(toks, device=seq.device)[:, None]], dim=1)
-            ok = len(out) == steps and all(len(t) == B for t in out) and worst <= TIE_MARGIN
+            if ok:
+                p.ids.copy_(_ids_tensor(input_ids))
+                logits = p.prefill().float()
+                for step, toks in enumerate(out):
+                    mine = torch.tensor(toks, device=logits.device)
+                    gap = (logits.max(dim=-1).values - logits.gather(1, mine[:, None])[:, 0]).max().item()
+                    worst = max(worst, gap)
+                    if step + 1 < steps:
+                        p.tok.copy_(mine)
+                        logits = p.decode().float()
+            ok = ok and worst <= 1.0
         except Exception as exc:
             _log(f"speculative self-check raised {exc!r}")
             ok, worst = False, float("inf")
-        _log(f"speculative self-check over {steps} steps: worst tie gap={worst:.3f} -> "
+        _log(f"speculative self-check over {steps} steps vs plain decode: worst gap={worst:.3f} -> "
              f"{'ok' if ok else 'FAILED, using plain decode'} ({time.perf_counter() - t0:.1f}s)")
         if not ok:
             plan.recycler = None
@@ -581,9 +588,12 @@ class Engine:
         if self.fallback is None:
             try:
                 plan = self._plan(B, T, max_new_tokens)
-                if self.self_check and not self.checked and not _self_check_done():
-                    self._run_self_check(plan, input_ids)
-                    _mark_self_check_done()
+                if self.self_check and not self.checked:
+                    if not _self_check_done():
+                        self._run_self_check(plan, input_ids)
+                        _mark_self_check_done()
+                    elif plan.recycler is not None:
+                        self._check_recycle(plan, None, input_ids)
                 self.checked = True
             except Exception as exc:
                 _log(f"custom engine unusable ({exc!r}); using the native baseline for this run")
