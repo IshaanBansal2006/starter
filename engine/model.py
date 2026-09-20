@@ -134,7 +134,7 @@ class Model:
             self.cos, self.sin = rope_tables(self.cfg, max_pos, self.device)
 
 
-def decode_matmuls(m: Model, M: int, log) -> dict[str, object]:
+def decode_matmuls(m: Model, M: int, log, cublas_only: bool = False) -> dict[str, object]:
     """Per-shape projection callables for M-row decode/verify steps.
 
     "qkv", "gu" and "lm" take ``(x, y, w_norm, xout, w)`` and fold the residual
@@ -149,7 +149,7 @@ def decode_matmuls(m: Model, M: int, log) -> dict[str, object]:
     y = torch.randn((M, cfg.hidden), dtype=bf16, device=m.device)
     a = torch.randn((M, cfg.heads * cfg.head_dim), dtype=bf16, device=m.device)
     act = torch.randn((M, cfg.intermediate), dtype=bf16, device=m.device)
-    if os.environ.get("ENGINE_FORCE_CUBLAS") == "1":
+    if cublas_only or os.environ.get("ENGINE_FORCE_CUBLAS") == "1":
         unfused = lambda x, y, wn, xout, w: add_rms_norm(x, y, wn, cfg.eps, xout) @ w.t()
         return {
             "qkv": unfused,
@@ -213,8 +213,9 @@ def run_layers(plan: "Plan", mm: dict, x: torch.Tensor, q_buf: torch.Tensor, att
 class Plan:
     """Static buffers, KV cache and step functions for one (B, T, max_new) shape."""
 
-    def __init__(self, model: Model, B: int, T: int, max_new: int):
+    def __init__(self, model: Model, B: int, T: int, max_new: int, plain_cheap: bool = False):
         self.model = model
+        self.plain_cheap = plain_cheap
         cfg = model.cfg
         self.B, self.T, self.max_new = B, T, max_new
         # Capacity covers the prompt, every output token, and a full draft block
@@ -251,7 +252,7 @@ class Plan:
             except RuntimeError as exc:
                 log(f"prefill SDPA backend {backend!r} unavailable here ({str(exc).splitlines()[0]}); using the default")
                 self.sdpa_backends = None
-        if os.environ.get("ENGINE_ATTN_DEFAULT") == "1":
+        if os.environ.get("ENGINE_ATTN_DEFAULT") == "1" or self.plain_cheap:
             self.attention = DecodeAttention(B, HQ, HKV, D, self.cap, dev)
         else:
                 self.attention = pick_attention(B, HQ, HKV, D, self.cap, T + max_new // 2, dev, log, maxlen=self.cap)
@@ -261,12 +262,8 @@ class Plan:
     def _pick_decode_matmuls(self) -> dict[str, object]:
         """Time cuBLAS against the Triton skinny GEMM for every decode shape."""
         m, cfg, B = self.model, self.model.cfg, self.B
-        layer = m.layers[0]
-        x = torch.randn((B, cfg.hidden), dtype=torch.bfloat16, device=m.device)
-        a = torch.randn((B, cfg.heads * cfg.head_dim), dtype=torch.bfloat16, device=m.device)
-        act = torch.randn((B, cfg.intermediate), dtype=torch.bfloat16, device=m.device)
         log = lambda s: print(f"[engine] {s}", file=sys.stderr, flush=True)
-        return decode_matmuls(m, B, log)
+        return decode_matmuls(m, B, log, cublas_only=self.plain_cheap)
 
     def _prefill_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         """The reference's own SDPA call (flash, causal) unless ENGINE_PREFILL_SDPA pins a backend."""
