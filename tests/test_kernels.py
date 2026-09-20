@@ -151,3 +151,29 @@ def test_pick_attention_returns_matching_kernel():
     from kernels import pick_attention
     attn = pick_attention(2, 8, 2, 128, 300, 250, "cuda")
     assert attn.NSPLIT >= 1
+
+
+def test_norm_prologue_matches_add_norm_then_gemm():
+    from kernels import add_rms_norm
+    from kernels.gemm import CONFIGS, SkinnyGateUp, SkinnyMatmul
+    torch.manual_seed(0)
+    for M in (1, 5, 16):
+        K, N, I = 2560, 1536, 1024
+        x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+        y = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+        wn = 1 + 0.1 * torch.randn(K, device="cuda", dtype=torch.bfloat16)
+        w = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.02
+        wgu = torch.randn(2 * I, K, device="cuda", dtype=torch.bfloat16) * 0.02
+        xout_ref = torch.empty_like(x)
+        h = add_rms_norm(x, y, wn, 1e-6, xout_ref)
+        ref = (h @ w.t()).float()
+        ref_gu = torch.nn.functional.silu(h @ wgu[:I].t()) * (h @ wgu[I:].t())
+        for cfg in CONFIGS:
+            xout = torch.empty_like(x)
+            out = SkinnyMatmul(M, N, K, x.device, **cfg)(x, w, norm=(y, wn, xout, 1e-6)).float()
+            assert torch.equal(xout, xout_ref), (M, cfg)
+            assert (out - ref).abs().max().item() <= 0.02 * ref.abs().max().item() + 1e-3, (M, cfg)
+            xout2 = torch.empty_like(x)
+            out2 = SkinnyGateUp(M, I, K, x.device, **cfg)(x, wgu[:I], wgu[I:], norm=(y, wn, xout2, 1e-6)).float()
+            assert torch.equal(xout2, xout_ref), (M, cfg)
+            assert (out2 - ref_gu.float()).abs().max().item() <= 0.02 * ref_gu.abs().max().item() + 1e-3, (M, cfg)
