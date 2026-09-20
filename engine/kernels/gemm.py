@@ -86,7 +86,8 @@ def _skinny_kernel(
                 a = _normed_tile(a_ptr, y_ptr, wn_ptr, rstd, rm, kk, stride_am, a_mask)
             else:
                 a = tl.load(a_ptr + rm[:, None] * stride_am + kk[None, :], mask=a_mask, other=0.0)
-            w = tl.load(w_ptr + rn[:, None] * stride_wn + kk[None, :], mask=n_mask[:, None] & k_mask[None, :], other=0.0)
+            w = tl.load(w_ptr + rn[:, None] * stride_wn + kk[None, :], mask=n_mask[:, None] & k_mask[None, :], other=0.0,
+                        eviction_policy="evict_first")
             acc += tl.dot(a, tl.trans(w))
         if SPLIT_K == 1:
             tl.store(c_ptr + rm[:, None] * N + rn[None, :], acc.to(tl.bfloat16), mask=m_mask[:, None] & n_mask[None, :])
@@ -149,8 +150,10 @@ def _gateup_kernel(
                 a = _normed_tile(a_ptr, y_ptr, wn_ptr, rstd, rm, kk, stride_am, a_mask)
             else:
                 a = tl.load(a_ptr + rm[:, None] * stride_am + kk[None, :], mask=a_mask, other=0.0)
-            wg = tl.load(wg_ptr + rn[:, None] * stride_wn + kk[None, :], mask=n_mask[:, None] & k_mask[None, :], other=0.0)
-            wu = tl.load(wu_ptr + rn[:, None] * stride_wn + kk[None, :], mask=n_mask[:, None] & k_mask[None, :], other=0.0)
+            wg = tl.load(wg_ptr + rn[:, None] * stride_wn + kk[None, :], mask=n_mask[:, None] & k_mask[None, :], other=0.0,
+                         eviction_policy="evict_first")
+            wu = tl.load(wu_ptr + rn[:, None] * stride_wn + kk[None, :], mask=n_mask[:, None] & k_mask[None, :], other=0.0,
+                         eviction_policy="evict_first")
             acc_g += tl.dot(a, tl.trans(wg))
             acc_u += tl.dot(a, tl.trans(wu))
         out_mask = m_mask[:, None] & n_mask[None, :]
@@ -233,10 +236,12 @@ def _gemv_kernel(
                 a = _normed_row(a_ptr + m * stride_am, y_ptr + m * stride_am, wn_ptr, rstd, kk, k_mask)
             else:
                 a = tl.load(a_ptr + m * stride_am + kk, mask=k_mask, other=0.0).to(tl.float32)
-            w = tl.load(w_ptr + rn[:, None] * stride_wn + kk[None, :], mask=n_mask[:, None] & k_mask[None, :], other=0.0)
+            w = tl.load(w_ptr + rn[:, None] * stride_wn + kk[None, :], mask=n_mask[:, None] & k_mask[None, :], other=0.0,
+                        eviction_policy="evict_first")
             acc += tl.sum(w.to(tl.float32) * a[None, :], axis=1)
             if GATEUP:
-                w2 = tl.load(w2_ptr + rn[:, None] * stride_wn + kk[None, :], mask=n_mask[:, None] & k_mask[None, :], other=0.0)
+                w2 = tl.load(w2_ptr + rn[:, None] * stride_wn + kk[None, :], mask=n_mask[:, None] & k_mask[None, :], other=0.0,
+                             eviction_policy="evict_first")
                 acc2 += tl.sum(w2.to(tl.float32) * a[None, :], axis=1)
         if SPLIT_K == 1:
             if GATEUP:
