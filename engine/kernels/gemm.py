@@ -11,6 +11,13 @@ stores directly. Whether this beats cuBLAS is measured per shape at warmup
 
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
 import torch
 import triton
 import triton.language as tl
@@ -388,7 +395,6 @@ CONFIGS = [
 WIDE_CONFIGS = [
     dict(block_n=64, block_k=64, split_k=1, num_warps=8, num_stages=3, persist=1),
     dict(block_n=32, block_k=64, split_k=2, num_warps=8, num_stages=3, persist=2),
-    dict(block_n=64, block_k=128, split_k=1, num_warps=8, num_stages=2),
     dict(block_n=32, block_k=128, split_k=1, num_warps=4, num_stages=3),
 ]
 
@@ -399,44 +405,66 @@ def _configs_for(M: int) -> list:
 
 
 _PROBED: dict = {}
+_PROBE_CACHE = os.path.join(tempfile.gettempdir(), "dryft-wide-probe.json")
 
 
 def _probe_wide(kind: str, M: int, N: int, K: int, cfg: dict, log=None) -> bool:
-    """Run a wide-tile (M >= 64) kernel once in a subprocess before using it here.
-
-    Wide tiles take a different code path on Hopper (wgmma) that this project
-    cannot exercise locally; an illegal access there is a sticky CUDA error that
-    would end the run, so it is tried where a crash costs nothing.
-    """
-    import subprocess, sys, json
-    # One probe per (kernel kind, tile height): every wide config shares the same
-    # code path, and a probe costs ~10 s of the 300 s load budget.
-    key = (kind, _block_m(M))
+    """Wide tiles (M >= 64) take a Hopper code path this project cannot exercise
+    locally; an illegal access there is a sticky CUDA error that would end the
+    run. So every wide code path is exercised once per container, all three
+    kernel kinds in ONE subprocess (~15 s), and the verdict is cached in a file
+    shared by the workload processes of the run."""
+    key = f"{kind}:{_block_m(M)}"
     if key in _PROBED:
         return _PROBED[key]
-    code = (
-        "import sys, torch; sys.path.insert(0, %r)\n"
-        "from kernels.gemm import SkinnyMatmul, SkinnyGateUp\n"
-        "M,N,K=%d,%d,%d; cfg=%s; kind=%r\n"
-        "a=torch.randn(M,K,device='cuda',dtype=torch.bfloat16); w=torch.randn(N if kind!='gateup' else 2*N,K,device='cuda',dtype=torch.bfloat16)*0.02\n"
-        "y=torch.randn(M,K,device='cuda',dtype=torch.bfloat16); wn=torch.ones(K,device='cuda',dtype=torch.bfloat16); xo=torch.empty_like(a)\n"
-        "for norm in (None,(y,wn,xo,1e-6)):\n"
-        "    if kind=='gateup': out=SkinnyGateUp(M,N,K,a.device,**cfg)(a,w[:N],w[N:],norm=norm)\n"
-        "    else: out=SkinnyMatmul(M,N,K,a.device,**cfg)(a,w,norm=norm)\n"
-        "    torch.cuda.synchronize(); assert torch.isfinite(out.float()).all()\n"
-        "print('ok')\n"
-    ) % (str(__import__('pathlib').Path(__file__).resolve().parents[1]), M, N, K, json.dumps(cfg), kind)
+    cached = {}
     try:
-        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
-        ok = r.returncode == 0 and "ok" in r.stdout
-        if not ok and log:
-            log(f"wide probe {kind} M={M} {cfg} failed: rc={r.returncode} {r.stderr.strip().splitlines()[-1:] }")
+        with open(_PROBE_CACHE) as f:
+            cached = json.load(f)
+    except (OSError, ValueError):
+        pass
+    if key in cached:
+        _PROBED[key] = bool(cached[key])
+        return _PROBED[key]
+    bm = _block_m(M)
+    root = str(Path(__file__).resolve().parents[1])
+    code = (
+        "import sys, json, torch; sys.path.insert(0, %r)\n"
+        "from kernels.gemm import SkinnyMatmul, SkinnyGateUp, WIDE_CONFIGS\n"
+        "M=%d; out={}\n"
+        "def run(kind):\n"
+        "    K=2560; N=6144 if kind!='gateup' else 9728\n"
+        "    a=torch.randn(M,K,device='cuda',dtype=torch.bfloat16); w=torch.randn((2 if kind=='gateup' else 1)*N,K,device='cuda',dtype=torch.bfloat16)*0.02\n"
+        "    y=torch.randn(M,K,device='cuda',dtype=torch.bfloat16); wn=torch.ones(K,device='cuda',dtype=torch.bfloat16); xo=torch.empty_like(a)\n"
+        "    for cfg in WIDE_CONFIGS:\n"
+        "        for norm in (None,(y,wn,xo,1e-6)):\n"
+        "            try:\n"
+        "                o = SkinnyGateUp(M,N,K,a.device,**cfg)(a,w[:N],w[N:],norm=norm) if kind=='gateup' else SkinnyMatmul(M,N,K,a.device,**cfg)(a,w,norm=norm)\n"
+        "                torch.cuda.synchronize(); assert torch.isfinite(o.float()).all()\n"
+        "            except Exception as e:\n"
+        "                if 'OutOfResources' not in type(e).__name__: raise\n"
+        "for kind in ('matmul','gateup'):\n"
+        "    run(kind); out[f'{kind}:{M}']=True\n"
+        "print(json.dumps(out))\n"
+    ) % (root, bm)
+    verdict = {f"matmul:{bm}": False, f"gateup:{bm}": False}
+    try:
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=150)
+        if r.returncode == 0 and r.stdout.strip():
+            verdict.update(json.loads(r.stdout.strip().splitlines()[-1]))
+        elif log:
+            log(f"wide probe M={bm} failed: rc={r.returncode} {r.stderr.strip().splitlines()[-1:]}")
     except Exception as exc:
-        ok = False
         if log:
-            log(f"wide probe {kind} M={M} {cfg} error: {exc!r}")
-    _PROBED[key] = ok
-    return ok
+            log(f"wide probe M={bm} error: {exc!r}")
+    cached.update(verdict)
+    try:
+        with open(_PROBE_CACHE, "w") as f:
+            json.dump(cached, f)
+    except OSError:
+        pass
+    _PROBED.update({k: bool(v) for k, v in verdict.items()})
+    return _PROBED.get(key, False)
 
 
 def _time(fn, iters: int = 30, rotate: list | None = None) -> float:
