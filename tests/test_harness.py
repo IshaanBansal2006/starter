@@ -74,3 +74,33 @@ def test_self_check_failure_falls_back_to_baseline(monkeypatch, capfd):
     from baseline import BaselineEngine
     assert len(out) == 5 and all(len(step) == 2 for step in out)
     assert "FAILED" in capfd.readouterr().err
+
+
+def test_resumed_fallback_stays_on_our_prefix(monkeypatch, capfd):
+    """A mid-sample exception must not splice a different trajectory in."""
+    import os
+    os.environ["ENGINE_RECYCLE"] = "0"
+    import engine as engine_mod
+    from tiny import load_reference
+    import torch
+    eng = engine_mod.Engine(str(make_tiny(TINY)))
+    ids = torch.randint(0, 1024, (2, 30), generator=torch.Generator().manual_seed(6)).tolist()
+    plan = eng._plan(2, 30, 10)
+    real_run = plan.run
+    def broken_run(input_ids, max_new):
+        for i, step in enumerate(real_run(input_ids, max_new)):
+            if i == 4:
+                raise RuntimeError("boom")
+            yield step
+    monkeypatch.setattr(plan, "run", broken_run)
+    out = list(eng.generate(ids, 10))
+    assert len(out) == 10 and "finishing with the native baseline" in capfd.readouterr().err
+    ref = load_reference(TINY)
+    seq = torch.tensor(ids, device="cuda:0")
+    for toks in out:
+        with torch.inference_mode():
+            logits = ref(input_ids=seq, use_cache=False).logits[:, -1].float()
+        top = logits.max(-1).values
+        mine = logits[torch.arange(2), torch.tensor(toks, device="cuda:0")]
+        assert torch.all(top - mine <= 2.0)
+        seq = torch.cat([seq, torch.tensor(toks, device="cuda:0")[:, None]], dim=1)

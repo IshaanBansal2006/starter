@@ -362,6 +362,8 @@ class Engine:
         # Tree nodes per sequence: each 64 query rows (16 nodes x 4 heads) that a
         # sequence's tree adds is another pass over its KV cache.
         self.tree_rows_by_batch = {1: 64, 2: 32, 4: 16, 8: 8, 16: 4, 32: 4}
+        # Tuning override (unset in a run): one row count for every batch size.
+        self.tree_rows_env = int(os.environ.get("ENGINE_TREE_ROWS", "0"))
         self.self_check = os.environ.get("ENGINE_SELF_CHECK", "1") == "1"
         self.checked = False
         budget.start(PICKER_BUDGET_S)
@@ -414,13 +416,44 @@ class Engine:
             if step + 1 < steps:
                 p.tok.copy_(forced)
                 mine = p.decode().float()
-        del ref
-        torch.cuda.empty_cache()
         ok = worst_gap <= TIE_MARGIN and worst_diff <= SELF_CHECK_MAX_DIFF
         _log(f"self-check vs transformers over {steps} steps: max|dlogit|={worst_diff:.3f} "
              f"worst tie gap={worst_gap:.3f} -> {'ok' if ok else 'FAILED'} ({time.perf_counter() - t0:.1f}s)")
         if not ok:
+            del ref
+            torch.cuda.empty_cache()
             raise RuntimeError("custom engine disagrees with the reference")
+        if plan.recycler is not None:
+            self._check_recycle(plan, ref, input_ids)
+        del ref
+        torch.cuda.empty_cache()
+
+    def _check_recycle(self, plan: GraphPlan, ref, input_ids: list[list[int]], steps: int = 12) -> None:
+        """Run the speculative loop on the warmup prompt and judge every emitted
+        token against the reference on our own prefix; on failure the plan
+        drops to plain decode, which the first self-check already validated."""
+        t0 = time.perf_counter()
+        B = len(input_ids)
+        try:
+            out = list(plan.run(input_ids, steps))
+            seq = torch.tensor(input_ids, dtype=torch.int64, device=self.model.device)
+            worst = 0.0
+            for toks in out:
+                logits = ref.logits(seq)
+                top = logits.max(dim=-1).values
+                mine = logits.gather(1, torch.tensor(toks, device=logits.device)[:, None])[:, 0]
+                worst = max(worst, (top - mine).max().item())
+                seq = torch.cat([seq, torch.tensor(toks, device=seq.device)[:, None]], dim=1)
+            ok = len(out) == steps and all(len(t) == B for t in out) and worst <= TIE_MARGIN
+        except Exception as exc:
+            _log(f"speculative self-check raised {exc!r}")
+            ok, worst = False, float("inf")
+        _log(f"speculative self-check over {steps} steps: worst tie gap={worst:.3f} -> "
+             f"{'ok' if ok else 'FAILED, using plain decode'} ({time.perf_counter() - t0:.1f}s)")
+        if not ok:
+            plan.recycler = None
+            plan.verify = None
+            plan.plan.recycler = None
 
     def _plan(self, B: int, T: int, max_new: int) -> GraphPlan:
         key = (B, T)
@@ -434,6 +467,8 @@ class Engine:
             spec_k = self.spec_k if self.spec_k and B * (self.spec_k + 1) <= self.spec_max_rows else None
             rows = self.tree_rows_by_batch.get(B, max(0, 128 // B)) if self.recycle else 0
             rows = min(rows, self.spec_max_rows // B)
+            if self.recycle and self.tree_rows_env:
+                rows = self.tree_rows_env
             recycle_rows = rows if rows >= 2 else None
             plan = GraphPlan(self.model, B, T, max_new, spec_k=None if recycle_rows else spec_k,
                              recycle_rows=recycle_rows, recycle_k=self.recycle_k)
@@ -468,14 +503,16 @@ class Engine:
         if self.fallback is not None:
             yield from self.fallback.generate(input_ids, max_new_tokens)
             return
-        produced = 0
+        produced: list[list[int]] = []
         try:
             for step in plan.run(input_ids, max_new_tokens):
-                produced += 1
+                produced.append(step)
                 yield step
         except Exception as exc:  # a host-side bug must not end the run: finish with the baseline
-            _log(f"custom generate failed after {produced} steps ({exc!r}); finishing with the native baseline")
+            _log(f"custom generate failed after {len(produced)} steps ({exc!r}); finishing with the native baseline")
             self._use_fallback()
-            steps = list(self.fallback.generate(input_ids, max_new_tokens))
-            for step in steps[produced:]:
-                yield step
+            remaining = max_new_tokens - len(produced)
+            if remaining > 0:
+                # Continue on OUR prefix so the emitted sequence stays one greedy trajectory.
+                prefix = [row + [step[b] for step in produced] for b, row in enumerate(input_ids)]
+                yield from self.fallback.continue_from(prefix, remaining)

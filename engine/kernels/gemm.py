@@ -19,13 +19,11 @@ import budget
 
 
 @triton.jit
-def _norm_stats(x_ptr, y_ptr, xout_ptr, M, K, stride_am, eps, write_out,
+def _norm_stats(x_ptr, y_ptr, xout_ptr, rm, m_mask, K, stride_am, eps, write_out,
                 BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr):
     """Residual add over the whole row, its bf16 sum written once, and the
     per-row rsqrt(mean(sum^2) + eps) every program needs for its A tile."""
-    rm = tl.arange(0, BLOCK_M)
     rk = tl.arange(0, BLOCK_K)
-    m_mask = rm < M
     sumsq = tl.zeros([BLOCK_M], tl.float32)
     for k0 in range(0, K, BLOCK_K):
         kk = k0 + rk
@@ -64,18 +62,21 @@ def _skinny_kernel(
     SMs in whole waves instead of leaving a fractional last wave idle."""
     pid = tl.program_id(0)
     nprog = tl.num_programs(0)
-    rm = tl.arange(0, BLOCK_M)
     rk = tl.arange(0, BLOCK_K)
-    m_mask = rm < M
-    if NORM:
-        rstd = _norm_stats(a_ptr, y_ptr, xout_ptr, M, K, stride_am, eps, pid == 0, BLOCK_M, BLOCK_K)
+    n_tiles = tl.cdiv(N, BLOCK_N)
     for tile in range(pid, num_tiles, nprog):
-        pid_n = tile // SPLIT_K
-        pid_k = tile % SPLIT_K
+        pid_m = tile // (n_tiles * SPLIT_K)
+        rest = tile % (n_tiles * SPLIT_K)
+        pid_n = rest // SPLIT_K
+        pid_k = rest % SPLIT_K
+        rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        m_mask = rm < M
         rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         n_mask = rn < N
         k_start = pid_k * k_per_split
         k_end = tl.minimum(k_start + k_per_split, K)
+        if NORM:
+            rstd = _norm_stats(a_ptr, y_ptr, xout_ptr, rm, m_mask, K, stride_am, eps, (pid_n == 0) & (pid_k == 0), BLOCK_M, BLOCK_K)
         acc = tl.zeros([BLOCK_M, BLOCK_N], tl.float32)
         for k0 in range(k_start, k_end, BLOCK_K):
             kk = k0 + rk
@@ -123,18 +124,21 @@ def _gateup_kernel(
 ):
     pid = tl.program_id(0)
     nprog = tl.num_programs(0)
-    rm = tl.arange(0, BLOCK_M)
     rk = tl.arange(0, BLOCK_K)
-    m_mask = rm < M
-    if NORM:
-        rstd = _norm_stats(a_ptr, y_ptr, xout_ptr, M, K, stride_am, eps, pid == 0, BLOCK_M, BLOCK_K)
+    n_tiles = tl.cdiv(N, BLOCK_N)
     for tile in range(pid, num_tiles, nprog):
-        pid_n = tile // SPLIT_K
-        pid_k = tile % SPLIT_K
+        pid_m = tile // (n_tiles * SPLIT_K)
+        rest = tile % (n_tiles * SPLIT_K)
+        pid_n = rest // SPLIT_K
+        pid_k = rest % SPLIT_K
+        rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        m_mask = rm < M
         rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         n_mask = rn < N
         k_start = pid_k * k_per_split
         k_end = tl.minimum(k_start + k_per_split, K)
+        if NORM:
+            rstd = _norm_stats(a_ptr, y_ptr, xout_ptr, rm, m_mask, K, stride_am, eps, (pid_n == 0) & (pid_k == 0), BLOCK_M, BLOCK_K)
         acc_g = tl.zeros([BLOCK_M, BLOCK_N], tl.float32)
         acc_u = tl.zeros([BLOCK_M, BLOCK_N], tl.float32)
         for k0 in range(k_start, k_end, BLOCK_K):
@@ -307,7 +311,7 @@ class SkinnyGateUp:
         self.k_per_split = triton.cdiv(triton.cdiv(K, split_k), block_k) * block_k
         self.SPLIT_K = triton.cdiv(K, self.k_per_split)
         self.part = torch.empty((2 * self.SPLIT_K, M, N), dtype=torch.float32, device=device) if self.SPLIT_K > 1 else None
-        self.num_tiles = triton.cdiv(N, block_n) * self.SPLIT_K
+        self.num_tiles = triton.cdiv(M, self.BLOCK_M) * triton.cdiv(N, block_n) * self.SPLIT_K
         programs = min(self.num_tiles, persist * _sm_count(device)) if persist else self.num_tiles
         self.grid = (programs,)
 
@@ -339,7 +343,7 @@ class SkinnyMatmul:
         self.k_per_split = triton.cdiv(triton.cdiv(K, split_k), block_k) * block_k
         self.SPLIT_K = triton.cdiv(K, self.k_per_split)
         self.part = torch.empty((self.SPLIT_K, M, N), dtype=torch.float32, device=device) if self.SPLIT_K > 1 else None
-        self.num_tiles = triton.cdiv(N, block_n) * self.SPLIT_K
+        self.num_tiles = triton.cdiv(M, self.BLOCK_M) * triton.cdiv(N, block_n) * self.SPLIT_K
         programs = min(self.num_tiles, persist * _sm_count(device)) if persist else self.num_tiles
         self.grid = (programs,)
 
@@ -424,7 +428,7 @@ def pick_matmul(a: torch.Tensor, w: torch.Tensor, log=None, ws: list | None = No
     best_name, best_ms, best = "cublas", _time(lambda w: cublas(a, w), rotate=rot), cublas
     ref = cublas(a, w).float()
     candidates = []
-    if M <= 32:
+    if M <= 128:
         candidates += [("skinny", cfg, lambda cfg=cfg: SkinnyMatmul(M, N, K, a.device, **cfg)) for cfg in CONFIGS]
     if M == 1:
         candidates += [("gemv", cfg, lambda cfg=cfg: Gemv(M, N, K, a.device, **cfg)) for cfg in GEMV_CONFIGS]
@@ -465,7 +469,7 @@ def pick_gateup(a: torch.Tensor, wgu: torch.Tensor, log=None, ws: list | None = 
     best_name, best_ms, best = "cublas+swiglu", _time(lambda w: cublas(a, w), rotate=rot), cublas
     ref = cublas(a, wgu).float()
     candidates = []
-    if M <= 32:
+    if M <= 128:
         candidates += [("gateup", cfg, lambda cfg=cfg: SkinnyGateUp(M, I, K, a.device, **cfg)) for cfg in CONFIGS]
     if M == 1:
         candidates += [("gemv-gateup", cfg, lambda cfg=cfg: Gemv(M, I, K, a.device, gateup=True, **cfg)) for cfg in GEMV_CONFIGS]
@@ -513,7 +517,7 @@ def pick_normed(kind: str, x: torch.Tensor, y: torch.Tensor, w_norm: torch.Tenso
     ref_xout = xout.clone()
     I = w.shape[0] // 2
     candidates = []
-    if M <= 32:
+    if M <= 128:
         for cfg in CONFIGS:
             if kind == "matmul":
                 candidates.append(("skinny", cfg, lambda cfg=cfg: SkinnyMatmul(M, w.shape[0], K, x.device, **cfg),

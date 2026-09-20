@@ -152,3 +152,27 @@ score: 1085.2874764441376  failure:
 | public-0 | passed | 369.9 | 6.63x | 0.54 | 0.14 |  |
 | public-1 | passed | 460.9 | 3.04x | 0.70 | 0.21 |  |
 | public-2 | passed | 3003.7 | 4.50x | 0.68 | 0.19 |  |
+
+## 2026-09-20 05:21 UTC — official run `353c24ec-8ba2-4ac4-836b-45e83730b278` @ `7f0f98c` — failed
+
+commit 9ca99c0
+
+score: None  failure: incorrect_output The engine's tokens did not match native Qwen's greedy choice.
+
+| workload | status | tok/s | speedup | ttft ratio | tpot ratio | message |
+|---|---|---:|---:|---:|---:|---|
+| public-0 | passed | 350.0 | 6.98x | 0.53 | 0.13 |  |
+| public-1 | passed | 451.0 | 3.10x | 0.66 | 0.22 |  |
+| public-2 | passed | 2937.8 | 4.39x | 0.69 | 0.20 |  |
+
+## 2026-09-20 05:32 UTC — official run `823d4533-3e4a-45a0-8e6a-e20add798c26` @ `8db3965` — succeeded
+
+commit 7f0f98c
+
+score: 1109.2767773288615  failure:  
+
+| workload | status | tok/s | speedup | ttft ratio | tpot ratio | message |
+|---|---|---:|---:|---:|---:|---|
+| public-0 | passed | 333.8 | 11.74x | 0.29 | 0.08 |  |
+| public-1 | passed | 518.1 | 5.58x | 0.65 | 0.10 |  |
+| public-2 | passed | 3019.1 | 7.32x | 0.69 | 0.11 |  |
