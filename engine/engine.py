@@ -223,7 +223,7 @@ class Engine:
         self.model = None
         self.plans: dict[tuple[int, int], GraphPlan] = {}
         self.use_graphs = os.environ.get("ENGINE_NO_GRAPHS") is None
-        self.spec_k = int(os.environ.get("ENGINE_SPEC_K", "0")) or None
+        self.spec_k = int(os.environ.get("ENGINE_SPEC_K", "3")) or None
         self.spec_max_rows = int(os.environ.get("ENGINE_SPEC_MAX_ROWS", "64"))
         self.self_check = os.environ.get("ENGINE_SELF_CHECK", "1") == "1"
         self.checked = False

@@ -8,6 +8,8 @@
     python agent/dryft_cli.py go [engine_dir] [--official]   -> submit + run + wait + report
     python agent/dryft_cli.py latest [--official] [--note ..] -> run the newest push-created submission
     python agent/dryft_cli.py leaderboard
+    python agent/dryft_cli.py public-latest [--note ..]        -> cancel the auto official run on the newest
+                                                                 submission and run it publicly instead
 
 Reads DRYFT_TOKEN (and optional DRYFT_API, default https://htn.dryft.ai) from
 the environment or a ``.env`` file in the repo root. Every finished run is
@@ -167,6 +169,7 @@ def main(argv: list[str]) -> int:
     lg = sub.add_parser("logs"); lg.add_argument("run_id")
     sub.add_parser("runs"); sub.add_parser("submissions"); sub.add_parser("benchmark"); sub.add_parser("leaderboard")
     lt = sub.add_parser("latest"); lt.add_argument("--official", action="store_true"); lt.add_argument("--no-wait", action="store_true"); lt.add_argument("--note", default="")
+    pl = sub.add_parser("public-latest"); pl.add_argument("--no-wait", action="store_true"); pl.add_argument("--note", default="")
     args = ap.parse_args(argv)
     api = client()
 
@@ -185,6 +188,18 @@ def main(argv: list[str]) -> int:
             mark = "  <-- you" if it.get("isYou") else ""
             print(f"{it['rank']:3d} {it['team']:<24s} {it['score']:8.1f} tok/s{mark}")
         return 0
+    if args.cmd == "public-latest":
+        items = api._send("GET", "/api/v1/submissions?limit=5").get("items") or []
+        if not items:
+            print("no submissions yet"); return 1
+        newest = items[0]
+        for run in api._send("GET", "/api/v1/runs?limit=10").get("items") or []:
+            if run.get("submissionId") == newest["id"] and run.get("mode") == "official" and run.get("state") not in TERMINAL:
+                api._send("POST", f"/api/v1/runs/{run['id']}/cancel", body=json.dumps({"reason": "experiment: public run instead"}).encode(), content_type="application/json")
+                print(f"cancelled auto official run {run['id']}")
+        args.submission_id = newest["id"]
+        args.official = False
+        args.cmd = "run"
     if args.cmd == "latest":
         items = api._send("GET", "/api/v1/submissions?limit=5").get("items") or []
         if not items:
