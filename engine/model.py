@@ -312,6 +312,10 @@ class Plan:
         m = self.model
         ids = self.ids.view(-1)
         rows = h.shape[0]
+        stride = 2 if rows > 4096 else 1  # long prompts: every other position is plenty for the table
+        if stride > 1:
+            h, ids = h[::stride], ids[::stride]
+            rows = h.shape[0]
         for start in range(0, rows, chunk):
             logits = h[start:start + chunk] @ m.lm_head.t()
             self.recycler.update(ids[start:start + chunk], logits)
