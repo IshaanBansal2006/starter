@@ -183,3 +183,12 @@ def test_recycle_pads_rounds_to_minimum(engine, reference):
     assert len(out) == 12
     assert rec.stats["rounds"] >= rec.stats["min_rounds"] == 11
     judge(reference, ids, out)
+
+
+def test_spine_nodes_follow_rank_zero_path():
+    from recycle import TreeTemplate
+    t = TreeTemplate.build(64, 8)
+    spine = t.spine
+    assert spine and t.parent[spine[0]] == 0 and all(t.rank[n] == 0 for n in spine)
+    for a, b in zip(spine, spine[1:]):
+        assert t.parent[b] == a

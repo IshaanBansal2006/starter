@@ -38,3 +38,16 @@ class NGramDrafter:
                     out = out + [out[-1] if out else toks[-1]] * (self.K - len(out))
                 return out
         return [toks[-1]] * self.K
+
+    def draft_or_none(self) -> list[int] | None:
+        """Continuation after the longest suffix match of length >= min_n, or None."""
+        toks = self.tokens
+        L = len(toks)
+        for n in range(self.max_n, self.min_n - 1, -1):
+            if L < n:
+                continue
+            p = self.index[n].get(tuple(toks[L - n:]))
+            if p is not None:
+                out = toks[p:p + self.K]
+                return out if out else None
+        return None
