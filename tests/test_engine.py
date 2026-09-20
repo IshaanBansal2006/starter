@@ -102,3 +102,14 @@ def test_second_call_resets_cache(engine):
     list(engine.generate(a, new))
     again_b = list(engine.generate(b, new))
     assert first_b == again_b
+
+
+def test_longer_output_reuses_plan(engine):
+    B, T = 2, 40
+    vocab = engine.model.cfg.vocab
+    ids = prompts(B, T, vocab, seed=11)
+    list(engine.generate(ids, 4))
+    plan = engine.plans[(B, T)]
+    out = list(engine.generate(ids, 12))
+    assert engine.plans[(B, T)] is plan
+    assert len(out) == 12

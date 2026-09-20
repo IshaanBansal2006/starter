@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,7 +18,7 @@ import torch
 import torch.nn.functional as F
 from safetensors import safe_open
 
-from kernels import add_rms_norm, pick_attention, pick_gateup, pick_matmul, qk_norm_rope_cache, rms_norm, swiglu
+from kernels import DecodeAttention, add_rms_norm, pick_attention, pick_gateup, pick_matmul, qk_norm_rope_cache, rms_norm, swiglu
 
 
 @dataclass(frozen=True)
@@ -139,7 +140,9 @@ class Plan:
         self.model = model
         cfg = model.cfg
         self.B, self.T, self.max_new = B, T, max_new
-        self.cap = T + max_new
+        # Capacity is padded so a sample asking for a few more tokens than the
+        # warmup did still fits without rebuilding graphs inside a timed run.
+        self.cap = ((T + max(max_new, 256) + 63) // 64) * 64
         model.ensure_rope(self.cap)
         dev = model.device
         bf16 = torch.bfloat16
@@ -153,7 +156,11 @@ class Plan:
         self.q_decode = torch.empty((B, HQ, 1, D), dtype=bf16, device=dev)
         self.attn_decode = torch.empty((B, HQ, D), dtype=bf16, device=dev)
         log = lambda s: print(f"[engine] {s}", file=sys.stderr, flush=True)
-        self.attention = pick_attention(B, HQ, HKV, D, self.cap, T + max_new // 2, dev, log)
+        self.rope_fused = os.environ.get("ENGINE_ROPE_FUSED", "1") == "1"
+        if os.environ.get("ENGINE_ATTN_DEFAULT") == "1":
+            self.attention = DecodeAttention(B, HQ, HKV, D, self.cap, dev)
+        else:
+            self.attention = pick_attention(B, HQ, HKV, D, self.cap, T + max_new // 2, dev, log)
         self.mm = self._pick_decode_matmuls()
 
     def _pick_decode_matmuls(self) -> dict[str, object]:
@@ -164,6 +171,14 @@ class Plan:
         a = torch.randn((B, cfg.heads * cfg.head_dim), dtype=torch.bfloat16, device=m.device)
         act = torch.randn((B, cfg.intermediate), dtype=torch.bfloat16, device=m.device)
         log = lambda s: print(f"[engine] {s}", file=sys.stderr, flush=True)
+        if os.environ.get("ENGINE_FORCE_CUBLAS") == "1":
+            return {
+                "qkv": lambda a, w: a @ w.t(),
+                "o": lambda a, w: a @ w.t(),
+                "gu": lambda a, w: swiglu(a @ w.t()),
+                "d": lambda a, w: a @ w.t(),
+                "lm": lambda a, w: a @ w.t(),
+            }
         return {
             "qkv": pick_matmul(x, layer.wqkv, log),
             "o": pick_matmul(a, layer.wo, log),
@@ -188,7 +203,7 @@ class Plan:
         for i, layer in enumerate(m.layers):
             qkv = h @ layer.wqkv.t()
             qk_norm_rope_cache(qkv, layer.q_norm, layer.k_norm, m.cos, m.sin, self.pos,
-                               self.q_prefill, self.k_cache[i], self.v_cache[i], T, cfg.eps)
+                               self.q_prefill, self.k_cache[i], self.v_cache[i], T, cfg.eps, fused=self.rope_fused)
             a = F.scaled_dot_product_attention(
                 self.q_prefill, self.k_cache[i, :, :, :T], self.v_cache[i, :, :, :T],
                 is_causal=True, scale=m.scale, enable_gqa=True,
@@ -213,7 +228,7 @@ class Plan:
         for i, layer in enumerate(m.layers):
             qkv = mm["qkv"](h, layer.wqkv)
             qk_norm_rope_cache(qkv, layer.q_norm, layer.k_norm, m.cos, m.sin, self.pos,
-                               self.q_decode, self.k_cache[i], self.v_cache[i], 1, cfg.eps)
+                               self.q_decode, self.k_cache[i], self.v_cache[i], 1, cfg.eps, fused=self.rope_fused)
             self.attention(self.q_decode.view(B, HQ, D), self.k_cache[i], self.v_cache[i], self.pos, self.attn_decode)
             o = mm["o"](self.attn_decode.view(B, HQ * D), layer.wo)
             h2 = add_rms_norm(x, o, layer.post_norm, cfg.eps)

@@ -125,8 +125,11 @@ class Engine:
         self.use_graphs = os.environ.get("ENGINE_NO_GRAPHS") is None
 
     def _plan(self, B: int, T: int, max_new: int) -> GraphPlan:
-        key = (B, T, max_new)
+        key = (B, T)
         plan = self.plans.get(key)
+        if plan is not None and T + max_new > plan.plan.cap:
+            _log(f"max_new_tokens={max_new} exceeds planned capacity {plan.plan.cap}; rebuilding")
+            plan = None
         if plan is None:
             self.plans.clear()
             torch.cuda.empty_cache()
