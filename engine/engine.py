@@ -228,17 +228,19 @@ class GraphPlan:
                 idxs.append(path + [0] * (self.maxa - len(path)))
                 roots.append(toks[-1])
                 pos_host[b] += len(path) + 1
-            self.host_spine.fill_(-1)
+            np_spine = self.host_spine.numpy()
+            np_spine[:] = -1
             for b in range(B):
                 if len(queues[b]) >= max_new_tokens:
                     continue
                 sp = drafters[b].draft_or_none()
                 if sp:
-                    self.host_spine[b, :len(sp)] = torch.tensor(sp)
+                    np_spine[b, :len(sp)] = sp
             rec.spine.copy_(self.host_spine, non_blocking=True)
-            self.host_path_len.copy_(torch.tensor(lens, dtype=torch.int32))
-            self.host_path_idx.copy_(torch.tensor(idxs, dtype=torch.int32))
-            self.host_root.copy_(torch.tensor(roots, dtype=torch.int64))
+            np_len, np_idx, np_root = self.host_path_len.numpy(), self.host_path_idx.numpy(), self.host_root.numpy()
+            np_len[:] = lens
+            np_idx[:] = idxs
+            np_root[:] = roots
             self.path_len.copy_(self.host_path_len, non_blocking=True)
             self.path_idx.copy_(self.host_path_idx, non_blocking=True)
             rec.root.copy_(self.host_root, non_blocking=True)

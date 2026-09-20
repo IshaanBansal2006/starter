@@ -311,7 +311,10 @@ class Plan:
         Only the last prompt position is a real output; the rest reuse the final
         hidden states the prefill computed anyway, one LM-head chunk at a time."""
         m = self.model
-        ids = self.ids.view(-1)
+        B, T = self.B, self.T
+        tail = min(T, 1024)  # the most recent context is what the drafts will draw on
+        h = h.view(B, T, -1)[:, T - tail:].reshape(B * tail, -1)
+        ids = self.ids[:, T - tail:].reshape(-1)
         rows = h.shape[0]
         for start in range(0, rows, chunk):
             logits = h[start:start + chunk] @ m.lm_head.t()
