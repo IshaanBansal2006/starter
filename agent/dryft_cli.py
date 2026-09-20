@@ -219,7 +219,7 @@ def main(argv: list[str]) -> int:
         args.submission_id = sid
         args.no_wait = False
     if args.cmd in ("run", "go"):
-        mode = "official" if args.official else "public"
+        mode = "official"  # the live API accepts no other mode; every run is scored on the private set
         run = api.start_run(args.submission_id, mode=mode)
         print(f"{mode} run {run['id']} started")
         if args.no_wait:
