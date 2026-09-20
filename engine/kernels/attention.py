@@ -126,10 +126,9 @@ class DecodeAttention:
         work = min(cap, maxlen) if maxlen else cap
         self.tree = tree
         self.G = HQ // HKV
-        # Query rows per program: the whole group for small R; trees are split into
-        # row blocks (each re-reads K/V), 64 rows with 8 warps, else 32.
-        cap_rows = 64 if num_warps >= 8 else 32
-        self.GP = max(16, min(cap_rows, triton.next_power_of_2(self.G * R)))
+        # Query rows per program: the whole group for small R, 32-row blocks for
+        # trees (each block re-reads K/V; 64-row blocks crashed on the H100).
+        self.GP = max(16, min(32, triton.next_power_of_2(self.G * R)))
         self.row_blocks = triton.cdiv(self.G * R, self.GP)
         self.BLOCK_N = block_n
         self.num_warps, self.num_stages = num_warps, num_stages

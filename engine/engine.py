@@ -466,4 +466,14 @@ class Engine:
         if self.fallback is not None:
             yield from self.fallback.generate(input_ids, max_new_tokens)
             return
-        yield from plan.run(input_ids, max_new_tokens)
+        produced = 0
+        try:
+            for step in plan.run(input_ids, max_new_tokens):
+                produced += 1
+                yield step
+        except Exception as exc:  # a host-side bug must not end the run: finish with the baseline
+            _log(f"custom generate failed after {produced} steps ({exc!r}); finishing with the native baseline")
+            self._use_fallback()
+            steps = list(self.fallback.generate(input_ids, max_new_tokens))
+            for step in steps[produced:]:
+                yield step
