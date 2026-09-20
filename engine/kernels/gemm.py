@@ -396,6 +396,8 @@ WIDE_CONFIGS = [
     dict(block_n=64, block_k=64, split_k=1, num_warps=8, num_stages=3, persist=1),
     dict(block_n=32, block_k=64, split_k=2, num_warps=8, num_stages=3, persist=2),
     dict(block_n=32, block_k=128, split_k=1, num_warps=4, num_stages=3),
+    dict(block_n=128, block_k=64, split_k=1, num_warps=8, num_stages=4, persist=1),
+    dict(block_n=128, block_k=64, split_k=2, num_warps=8, num_stages=3, persist=2),
 ]
 
 
