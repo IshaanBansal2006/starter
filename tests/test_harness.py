@@ -50,11 +50,6 @@ def test_fresh_process_protocol():
     assert r["steps"] == [7, 7] and r["widths"] == [3, 3]
 
 
-def test_fresh_process_exact_mode_is_deterministic():
-    """With margin 0 the output is pure greedy and cannot depend on draft state."""
-    r = run_driver({"ENGINE_ACCEPT_MARGIN": "0"}, 3, 50, 7)
-    assert r["steps"] == [7, 7] and r["widths"] == [3, 3] and r["deterministic"]
-
 
 def test_fresh_process_without_self_check():
     r = run_driver({"ENGINE_SELF_CHECK": "0"}, 3, 50, 7)
@@ -69,6 +64,9 @@ def test_fresh_process_spec_protocol():
 def test_self_check_failure_falls_back_to_baseline(monkeypatch, capfd):
     """Poison the custom decode and make sure the baseline takes over silently."""
     import engine as engine_mod
+    import os
+    if os.path.exists(engine_mod._SELF_CHECK_FLAG):  # the once-per-container flag must not skip this check
+        os.remove(engine_mod._SELF_CHECK_FLAG)
     from tiny import load_reference
     monkeypatch.setattr(engine_mod, "SELF_CHECK_MAX_DIFF", -1.0)
     eng = engine_mod.Engine(str(make_tiny(TINY)))

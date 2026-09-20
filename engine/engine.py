@@ -52,7 +52,7 @@ from model import Model, Plan, VerifyPlan
 from recycle import Recycler
 from spec import NGramDrafter
 
-PICKER_BUDGET_S = 120.0
+PICKER_BUDGET_S = 60.0
 
 SELF_CHECK_STEPS = 6
 SELF_CHECK_TOPK = 10
@@ -62,6 +62,23 @@ TIE_MARGIN = 2.0
 
 def _log(msg: str) -> None:
     print(f"[engine] {msg}", file=sys.stderr, flush=True)
+
+
+_SELF_CHECK_FLAG = os.path.join(tempfile.gettempdir(), "dryft-selfcheck-ok")
+
+
+def _self_check_done() -> bool:
+    """The run's workload processes share one container; the reference
+    comparison (a full Transformers load) is only worth paying once per run."""
+    return os.path.exists(_SELF_CHECK_FLAG)
+
+
+def _mark_self_check_done() -> None:
+    try:
+        with open(_SELF_CHECK_FLAG, "w") as f:
+            f.write("ok")
+    except OSError:
+        pass
 
 
 def _ids_tensor(input_ids: list[list[int]]) -> torch.Tensor:
@@ -74,7 +91,9 @@ def _ids_tensor(input_ids: list[list[int]]) -> torch.Tensor:
 class GraphPlan:
     def __init__(self, model: Model, B: int, T: int, max_new: int, spec_k: int | None = None,
                  recycle_rows: int | None = None, recycle_k: int = 8):
-        self.plan = Plan(model, B, T, max_new)
+        # With recycling the plain decode path is only a fallback: cuBLAS and the
+        # default attention config keep its warmup to a few kernels.
+        self.plan = Plan(model, B, T, max_new, plain_cheap=bool(recycle_rows))
         self.B, self.T, self.max_new = B, T, max_new
         self.g_prefill: torch.cuda.CUDAGraph | None = None
         self.g_decode: torch.cuda.CUDAGraph | None = None
@@ -98,7 +117,7 @@ class GraphPlan:
             # Accept a draft whose logit is within this many logits of the row's
             # best; the judge allows 2.0 against native, our logits track native
             # to a few tenths. 0 restores exact greedy acceptance.
-            self.accept_margin = float(os.environ.get("ENGINE_ACCEPT_MARGIN", "0.75"))
+            self.accept_margin = float(os.environ.get("ENGINE_ACCEPT_MARGIN", "0"))
             self.maxa = self.recycler.maxa
             self.guard = 2 * R
             self.path_idx = torch.zeros((B, self.maxa), dtype=torch.int32, device=dev)
@@ -562,9 +581,10 @@ class Engine:
         if self.fallback is None:
             try:
                 plan = self._plan(B, T, max_new_tokens)
-                if self.self_check and not self.checked:
+                if self.self_check and not self.checked and not _self_check_done():
                     self._run_self_check(plan, input_ids)
-                    self.checked = True
+                    _mark_self_check_done()
+                self.checked = True
             except Exception as exc:
                 _log(f"custom engine unusable ({exc!r}); using the native baseline for this run")
                 self._use_fallback()
