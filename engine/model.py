@@ -17,6 +17,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from safetensors import safe_open
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from kernels import DecodeAttention, add_rms_norm, pick_attention, pick_gateup, pick_matmul, qk_norm_rope_cache, rms_norm, swiglu
 
@@ -157,6 +158,19 @@ class Plan:
         self.attn_decode = torch.empty((B, 1, HQ, D), dtype=bf16, device=dev)
         log = lambda s: print(f"[engine] {s}", file=sys.stderr, flush=True)
         self.rope_fused = os.environ.get("ENGINE_ROPE_FUSED", "1") == "1"
+        backend = os.environ.get("ENGINE_PREFILL_SDPA", "")
+        self.sdpa_backends = {
+            "flash": [SDPBackend.FLASH_ATTENTION],
+            "cudnn": [SDPBackend.CUDNN_ATTENTION],
+            "efficient": [SDPBackend.EFFICIENT_ATTENTION],
+        }.get(backend)
+        if self.sdpa_backends is not None:
+            try:
+                self._prefill_attention(self.q_prefill, self.k_cache[0, :, :, :T], self.v_cache[0, :, :, :T])
+                torch.cuda.synchronize()
+            except RuntimeError as exc:
+                log(f"prefill SDPA backend {backend!r} unavailable here ({str(exc).splitlines()[0]}); using the default")
+                self.sdpa_backends = None
         if os.environ.get("ENGINE_ATTN_DEFAULT") == "1":
             self.attention = DecodeAttention(B, HQ, HKV, D, self.cap, dev)
         else:
@@ -187,6 +201,14 @@ class Plan:
             "lm": pick_matmul(x, m.lm_head, log),
         }
 
+    def _prefill_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """The reference's own SDPA call (flash, causal) unless ENGINE_PREFILL_SDPA pins a backend."""
+        scale = self.model.scale
+        if self.sdpa_backends is None:
+            return F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=scale, enable_gqa=True)
+        with sdpa_kernel(self.sdpa_backends):
+            return F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=scale, enable_gqa=True)
+
     def _next_norm(self, i: int) -> torch.Tensor:
         layers = self.model.layers
         return layers[i + 1].in_norm if i + 1 < len(layers) else self.model.final_norm
@@ -204,10 +226,7 @@ class Plan:
             qkv = h @ layer.wqkv.t()
             qk_norm_rope_cache(qkv, layer.q_norm, layer.k_norm, m.cos, m.sin, self.pos,
                                self.q_prefill, self.k_cache[i], self.v_cache[i], T, cfg.eps, fused=self.rope_fused)
-            a = F.scaled_dot_product_attention(
-                self.q_prefill, self.k_cache[i, :, :, :T], self.v_cache[i, :, :, :T],
-                is_causal=True, scale=m.scale, enable_gqa=True,
-            )
+            a = self._prefill_attention(self.q_prefill, self.k_cache[i, :, :, :T], self.v_cache[i, :, :, :T])
             o = a.transpose(1, 2).reshape(B * T, HQ * D) @ layer.wo.t()
             h2 = add_rms_norm(x, o, layer.post_norm, cfg.eps)
             d = swiglu(h2 @ layer.wgu.t()) @ layer.wd.t()
