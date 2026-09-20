@@ -159,6 +159,126 @@ def _sum_gateup_kernel(part_ptr, c_ptr, MN, SPLIT_K: tl.constexpr, BLOCK: tl.con
     tl.store(c_ptr + idx, _swiglu_epilogue(g, u), mask=mask)
 
 
+@triton.jit
+def _row_rstd(x_ptr, y_ptr, xout_ptr, K, eps, write_out, BLOCK_K: tl.constexpr):
+    rk = tl.arange(0, BLOCK_K)
+    sumsq = tl.zeros([BLOCK_K], tl.float32)
+    for k0 in range(0, K, BLOCK_K):
+        kk = k0 + rk
+        mask = kk < K
+        x = tl.load(x_ptr + kk, mask=mask, other=0.0).to(tl.float32)
+        y = tl.load(y_ptr + kk, mask=mask, other=0.0).to(tl.float32)
+        sb = (x + y).to(tl.bfloat16)
+        if write_out:
+            tl.store(xout_ptr + kk, sb, mask=mask)
+        sf = sb.to(tl.float32)
+        sumsq += sf * sf
+    return tl.math.rsqrt(tl.sum(sumsq, axis=0) / K + eps)
+
+
+@triton.jit
+def _normed_row(x_ptr, y_ptr, wn_ptr, rstd, kk, mask):
+    x = tl.load(x_ptr + kk, mask=mask, other=0.0).to(tl.float32)
+    y = tl.load(y_ptr + kk, mask=mask, other=0.0).to(tl.float32)
+    s = (x + y).to(tl.bfloat16).to(tl.float32)
+    n = (s * rstd).to(tl.bfloat16).to(tl.float32)
+    w = tl.load(wn_ptr + kk, mask=mask, other=0.0).to(tl.float32)
+    return (n * w).to(tl.bfloat16).to(tl.float32)
+
+
+@triton.jit
+def _gemv_kernel(
+    a_ptr, w_ptr, w2_ptr, c_ptr, part_ptr,
+    M, N, K, stride_am, stride_wn, k_per_split,
+    y_ptr, wn_ptr, xout_ptr, eps,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, SPLIT_K: tl.constexpr,
+    NORM: tl.constexpr, GATEUP: tl.constexpr,
+):
+    """CUDA-core GEMV: every program streams BLOCK_N weight rows over its K slice
+    in long contiguous segments and reduces in fp32 registers. Rows are unrolled
+    statically and each re-reads the weights, so it is only offered for M == 1."""
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    rk = tl.arange(0, BLOCK_K)
+    n_mask = rn < N
+    k_start = pid_k * k_per_split
+    k_end = tl.minimum(k_start + k_per_split, K)
+    first = (pid_n == 0) & (pid_k == 0)
+    for m in tl.static_range(BLOCK_M):
+        if NORM:
+            rstd = _row_rstd(a_ptr + m * stride_am, y_ptr + m * stride_am, xout_ptr + m * stride_am, K, eps, first, BLOCK_K)
+        acc = tl.zeros([BLOCK_N], tl.float32)
+        if GATEUP:
+            acc2 = tl.zeros([BLOCK_N], tl.float32)
+        for k0 in range(k_start, k_end, BLOCK_K):
+            kk = k0 + rk
+            k_mask = kk < k_end
+            if NORM:
+                a = _normed_row(a_ptr + m * stride_am, y_ptr + m * stride_am, wn_ptr, rstd, kk, k_mask)
+            else:
+                a = tl.load(a_ptr + m * stride_am + kk, mask=k_mask, other=0.0).to(tl.float32)
+            w = tl.load(w_ptr + rn[:, None] * stride_wn + kk[None, :], mask=n_mask[:, None] & k_mask[None, :], other=0.0)
+            acc += tl.sum(w.to(tl.float32) * a[None, :], axis=1)
+            if GATEUP:
+                w2 = tl.load(w2_ptr + rn[:, None] * stride_wn + kk[None, :], mask=n_mask[:, None] & k_mask[None, :], other=0.0)
+                acc2 += tl.sum(w2.to(tl.float32) * a[None, :], axis=1)
+        if SPLIT_K == 1:
+            if GATEUP:
+                tl.store(c_ptr + m * N + rn, _swiglu_epilogue(acc, acc2), mask=n_mask)
+            else:
+                tl.store(c_ptr + m * N + rn, acc.to(tl.bfloat16), mask=n_mask)
+        else:
+            tl.store(part_ptr + (pid_k * M + m) * N + rn, acc, mask=n_mask)
+            if GATEUP:
+                tl.store(part_ptr + ((SPLIT_K + pid_k) * M + m) * N + rn, acc2, mask=n_mask)
+
+
+class Gemv:
+    """Row-unrolled GEMV, optionally with the SwiGLU pair and the norm prologue."""
+
+    def __init__(self, M: int, N: int, K: int, device, block_n: int, block_k: int, split_k: int,
+                 num_warps: int, num_stages: int, gateup: bool = False):
+        if M > 4:
+            raise ValueError("Gemv handles at most 4 rows")
+        self.M, self.N, self.K, self.gateup = M, N, K, gateup
+        self.BLOCK_N, self.BLOCK_K = block_n, block_k
+        self.num_warps, self.num_stages = num_warps, num_stages
+        self.k_per_split = triton.cdiv(triton.cdiv(K, split_k), block_k) * block_k
+        self.SPLIT_K = triton.cdiv(K, self.k_per_split)
+        parts = (2 if gateup else 1) * self.SPLIT_K
+        self.part = torch.empty((parts, M, N), dtype=torch.float32, device=device) if self.SPLIT_K > 1 else None
+        self.grid = (triton.cdiv(N, block_n), self.SPLIT_K)
+
+    def __call__(self, a: torch.Tensor, w: torch.Tensor, w2: torch.Tensor | None = None, norm=None) -> torch.Tensor:
+        c = torch.empty((self.M, self.N), dtype=torch.bfloat16, device=a.device)
+        y, wn, xout, eps = norm if norm is not None else (a, w, a, 0.0)
+        _gemv_kernel[self.grid](
+            a, w, w2 if w2 is not None else w, c, self.part if self.part is not None else c,
+            self.M, self.N, self.K, a.stride(0), w.stride(0), self.k_per_split,
+            y, wn, xout, eps,
+            BLOCK_M=self.M, BLOCK_N=self.BLOCK_N, BLOCK_K=self.BLOCK_K, SPLIT_K=self.SPLIT_K,
+            NORM=norm is not None, GATEUP=self.gateup,
+            num_warps=self.num_warps, num_stages=self.num_stages,
+        )
+        if self.SPLIT_K > 1:
+            MN = self.M * self.N
+            if self.gateup:
+                _sum_gateup_kernel[(triton.cdiv(MN, 1024),)](self.part, c, MN, SPLIT_K=self.SPLIT_K, BLOCK=1024, num_warps=4)
+            else:
+                _sum_kernel[(triton.cdiv(MN, 1024),)](self.part, c, MN, SPLIT_K=self.SPLIT_K, BLOCK=1024, num_warps=4)
+        return c
+
+
+GEMV_CONFIGS = [
+    dict(block_n=32, block_k=256, split_k=1, num_warps=4, num_stages=3),
+    dict(block_n=16, block_k=512, split_k=1, num_warps=4, num_stages=3),
+    dict(block_n=32, block_k=256, split_k=4, num_warps=4, num_stages=3),
+    dict(block_n=64, block_k=128, split_k=4, num_warps=4, num_stages=3),
+    dict(block_n=16, block_k=256, split_k=8, num_warps=2, num_stages=3),
+]
+
+
 class SkinnyGateUp:
     """``swiglu(a @ wg.T, a @ wu.T)`` in one pass over both weight halves."""
 
@@ -255,24 +375,28 @@ def pick_matmul(a: torch.Tensor, w: torch.Tensor, log=None):
     cublas = lambda a, w: a @ w.t()
     best_name, best_ms, best = "cublas", _time(lambda: cublas(a, w)), cublas
     ref = cublas(a, w).float()
+    candidates = []
     if M <= 32:
-        for cfg in CONFIGS:
-            try:
-                mm = SkinnyMatmul(M, N, K, a.device, **cfg)
-                out = mm(a, w).float()
-                err = (out - ref).abs().max().item()
-                tol = 0.02 * ref.abs().max().item() + 1e-3
-                if err > tol:
-                    if log:
-                        log(f"skinny {cfg} rejected: err {err:.4g} > {tol:.4g}")
-                    continue
-                ms = _time(lambda: mm(a, w))
-            except Exception as exc:  # a config that will not compile on this device is simply not used
+        candidates += [("skinny", cfg, lambda cfg=cfg: SkinnyMatmul(M, N, K, a.device, **cfg)) for cfg in CONFIGS]
+    if M == 1:
+        candidates += [("gemv", cfg, lambda cfg=cfg: Gemv(M, N, K, a.device, **cfg)) for cfg in GEMV_CONFIGS]
+    for name, cfg, build in candidates:
+        try:
+            mm = build()
+            out = mm(a, w).float()
+            err = (out - ref).abs().max().item()
+            tol = 0.02 * ref.abs().max().item() + 1e-3
+            if err > tol:
                 if log:
-                    log(f"skinny {cfg} failed: {exc}")
+                    log(f"{name} {cfg} rejected: err {err:.4g} > {tol:.4g}")
                 continue
-            if ms < best_ms:
-                best_name, best_ms, best = f"triton{cfg}", ms, mm
+            ms = _time(lambda: mm(a, w))
+        except Exception as exc:  # a config that will not compile on this device is simply not used
+            if log:
+                log(f"{name} {cfg} failed: {exc}")
+            continue
+        if ms < best_ms:
+            best_name, best_ms, best = f"{name}{cfg}", ms, mm
     if log:
         log(f"matmul M={M} N={N} K={K}: {best_name} {best_ms * 1000:.1f}us "
             f"({2 * M * N * K / best_ms / 1e6:.0f} GFLOP/s, {N * K * 2 / best_ms / 1e6:.0f} GB/s)")
@@ -289,24 +413,28 @@ def pick_gateup(a: torch.Tensor, wgu: torch.Tensor, log=None):
     cublas = lambda a, wgu: swiglu(a @ wgu.t())
     best_name, best_ms, best = "cublas+swiglu", _time(lambda: cublas(a, wgu)), cublas
     ref = cublas(a, wgu).float()
+    candidates = []
     if M <= 32:
-        for cfg in CONFIGS:
-            try:
-                mm = SkinnyGateUp(M, I, K, a.device, **cfg)
-                out = mm(a, wg, wu).float()
-                err = (out - ref).abs().max().item()
-                tol = 0.02 * ref.abs().max().item() + 1e-3
-                if err > tol:
-                    if log:
-                        log(f"gateup {cfg} rejected: err {err:.4g} > {tol:.4g}")
-                    continue
-                ms = _time(lambda: mm(a, wg, wu))
-            except Exception as exc:
+        candidates += [("gateup", cfg, lambda cfg=cfg: SkinnyGateUp(M, I, K, a.device, **cfg)) for cfg in CONFIGS]
+    if M == 1:
+        candidates += [("gemv-gateup", cfg, lambda cfg=cfg: Gemv(M, I, K, a.device, gateup=True, **cfg)) for cfg in GEMV_CONFIGS]
+    for name, cfg, build in candidates:
+        try:
+            mm = build()
+            out = mm(a, wg, wu).float()
+            err = (out - ref).abs().max().item()
+            tol = 0.02 * ref.abs().max().item() + 1e-3
+            if err > tol:
                 if log:
-                    log(f"gateup {cfg} failed: {exc}")
+                    log(f"{name} {cfg} rejected: err {err:.4g} > {tol:.4g}")
                 continue
-            if ms < best_ms:
-                best_name, best_ms, best = f"triton{cfg}", ms, (lambda a, wgu, mm=mm: mm(a, wgu[:I], wgu[I:]))
+            ms = _time(lambda: mm(a, wg, wu))
+        except Exception as exc:
+            if log:
+                log(f"{name} {cfg} failed: {exc}")
+            continue
+        if ms < best_ms:
+            best_name, best_ms, best = f"{name}{cfg}", ms, (lambda a, wgu, mm=mm: mm(a, wgu[:I], wgu[I:]))
     if log:
         log(f"gateup M={M} I={I} K={K}: {best_name} {best_ms * 1000:.1f}us ({2 * I * K * 2 / best_ms / 1e6:.0f} GB/s)")
     return best
@@ -329,29 +457,40 @@ def pick_normed(kind: str, x: torch.Tensor, y: torch.Tensor, w_norm: torch.Tenso
     best_name, best_ms, best = "add_norm+" + kind, _time(lambda: unfused(x, y, w_norm, xout, w)), unfused
     ref = unfused(x, y, w_norm, xout, w).float()
     ref_xout = xout.clone()
+    I = w.shape[0] // 2
+    candidates = []
     if M <= 32:
-        I = w.shape[0] // 2
         for cfg in CONFIGS:
+            if kind == "matmul":
+                candidates.append(("skinny", cfg, lambda cfg=cfg: SkinnyMatmul(M, w.shape[0], K, x.device, **cfg),
+                                   lambda mm: (lambda x, y, w_norm, xout, w: mm(x, w, norm=(y, w_norm, xout, eps)))))
+            else:
+                candidates.append(("gateup", cfg, lambda cfg=cfg: SkinnyGateUp(M, I, K, x.device, **cfg),
+                                   lambda mm: (lambda x, y, w_norm, xout, w: mm(x, w[:I], w[I:], norm=(y, w_norm, xout, eps)))))
+    if M == 1:
+        for cfg in GEMV_CONFIGS:
+            if kind == "matmul":
+                candidates.append(("gemv", cfg, lambda cfg=cfg: Gemv(M, w.shape[0], K, x.device, **cfg),
+                                   lambda mm: (lambda x, y, w_norm, xout, w: mm(x, w, norm=(y, w_norm, xout, eps)))))
+            else:
+                candidates.append(("gemv-gateup", cfg, lambda cfg=cfg: Gemv(M, I, K, x.device, gateup=True, **cfg),
+                                   lambda mm: (lambda x, y, w_norm, xout, w: mm(x, w[:I], w[I:], norm=(y, w_norm, xout, eps)))))
+    for name, cfg, build, wrap in candidates:
             try:
-                if kind == "matmul":
-                    mm = SkinnyMatmul(M, w.shape[0], K, x.device, **cfg)
-                    fused = lambda x, y, w_norm, xout, w, mm=mm: mm(x, w, norm=(y, w_norm, xout, eps))
-                else:
-                    mm = SkinnyGateUp(M, I, K, x.device, **cfg)
-                    fused = lambda x, y, w_norm, xout, w, mm=mm: mm(x, w[:I], w[I:], norm=(y, w_norm, xout, eps))
+                fused = wrap(build())
                 out = fused(x, y, w_norm, xout, w).float()
                 err = (out - ref).abs().max().item()
                 if err > 0.02 * ref.abs().max().item() + 1e-3 or not torch.equal(xout, ref_xout):
                     if log:
-                        log(f"normed {kind} {cfg} rejected: err {err:.4g}")
+                        log(f"normed {name} {cfg} rejected: err {err:.4g}")
                     continue
                 ms = _time(lambda: fused(x, y, w_norm, xout, w))
             except Exception as exc:
                 if log:
-                    log(f"normed {kind} {cfg} failed: {exc}")
+                    log(f"normed {name} {cfg} failed: {exc}")
                 continue
             if ms < best_ms:
-                best_name, best_ms, best = f"fused-norm triton{cfg}", ms, fused
+                best_name, best_ms, best = f"fused-norm {name}{cfg}", ms, fused
     if log:
         log(f"normed {kind} M={M} N={w.shape[0]} K={K}: {best_name} {best_ms * 1000:.1f}us")
     return best

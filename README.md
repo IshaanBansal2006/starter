@@ -117,3 +117,10 @@ which the platform rejects.
 Limits: 2 MiB compressed, 16 MiB expanded, 200 files. Allowed extensions:
 `.py .pyi .yaml .yml .json .toml .txt .md .cfg .ini`. No weights, credentials,
 compiled binaries, Docker images, or agent code.
+
+## This fork
+
+- **Engine layout**: `engine/engine.py` owns the `Engine`/`generate` loop, per-shape planning, and CUDA graph capture/replay; `engine/model.py` holds the static KV cache, warmup-timed cuBLAS/Triton kernel selection, and the prefill/decode/verify forwards; `engine/spec.py` is the n-gram speculative drafter; `engine/kernels/` holds the Triton RMSNorm, fused RoPE+cache, attention, and GEMM/SwiGLU kernels.
+- **Tests** (needs a local CUDA GPU): `.venv/bin/python -m pytest tests/` checks the custom forward and kernels against Transformers 4.51.3 on a tiny random-weight Qwen3 checkpoint.
+- **Submitting without the official `dryft` binary**: `python agent/dryft_cli.py go --note "what changed"` (add `--official` for a scored run) packages `engine/`, submits, waits, and appends the result to `docs/experiments.md`; it reads `DRYFT_TOKEN` from the environment or a `.env` file in the repo root.
+- Design rationale lives in `docs/decisions/`; run history lives in `docs/experiments.md`.

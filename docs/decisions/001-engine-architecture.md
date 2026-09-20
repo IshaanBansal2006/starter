@@ -99,6 +99,17 @@ on real prompts, neither of which the local dev GPU can produce.
 
 ## Consequences
 
+- Because option C has no compiler or library backstop for correctness, the
+  engine carries its own safety net: `Engine.__init__` falls back to a
+  verbatim Transformers implementation (`BaselineEngine` in
+  `engine/baseline.py`) if loading the custom `Model` throws, and the first
+  `generate` call runs an untimed, in-budget self-check
+  (`Engine._run_self_check`) that teacher-forces the custom prefill/decode
+  against `BaselineEngine` for several steps on the real warmup prompt. If the
+  custom engine's greedy token or top-10 logits drift past the judge's own
+  2.0-logit tie margin, every subsequent `generate` call for that process is
+  served by the baseline instead. This makes the custom path fail toward
+  *slower*, never toward *wrong*.
 - Every Triton specialization actually used must be launched during warmup,
   before graph capture: `GraphPlan._warm_eager()` runs a prefill, several
   decode steps, and (if speculative decoding is on) one verify pass eagerly,
