@@ -401,6 +401,11 @@ WIDE_CONFIGS = [
 ]
 
 
+#: A candidate replaces the incumbent only if it is at least this much faster;
+#: run 96040cdf showed a tile that wins a close isolated timing can lose in the round.
+PICK_MARGIN = 0.97
+
+
 def _configs_for(M: int) -> list:
     """Narrow tiles (M <= 32) reuse CONFIGS; wide tiles need fewer registers per row."""
     return CONFIGS if M <= 32 else WIDE_CONFIGS
@@ -494,13 +499,18 @@ def _time(fn, iters: int = 30, rotate: list | None = None) -> float:
             call(i)
     graph.replay()
     torch.cuda.synchronize()
-    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(3):
+    # Median of several timed replays: a single mean is easily skewed by a clock
+    # or scheduling hiccup, and a mis-picked kernel costs a whole run.
+    samples = []
+    for _ in range(5):
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
         graph.replay()
-    end.record()
-    torch.cuda.synchronize()
-    return start.elapsed_time(end) / (3 * iters)
+        end.record()
+        torch.cuda.synchronize()
+        samples.append(start.elapsed_time(end) / iters)
+    samples.sort()
+    return samples[len(samples) // 2]
 
 
 def pick_matmul(a: torch.Tensor, w: torch.Tensor, log=None, ws: list | None = None):
@@ -540,7 +550,7 @@ def pick_matmul(a: torch.Tensor, w: torch.Tensor, log=None, ws: list | None = No
             if log:
                 log(f"{name} {cfg} failed: {exc}")
             continue
-        if ms < best_ms:
+        if ms < best_ms * PICK_MARGIN:
             best_name, best_ms, best = f"{name}{cfg}", ms, mm
     if log:
         log(f"matmul M={M} N={N} K={K}: {best_name} {best_ms * 1000:.1f}us "
@@ -582,7 +592,7 @@ def pick_gateup(a: torch.Tensor, wgu: torch.Tensor, log=None, ws: list | None = 
             if log:
                 log(f"{name} {cfg} failed: {exc}")
             continue
-        if ms < best_ms:
+        if ms < best_ms * PICK_MARGIN:
             best_name, best_ms, best = f"{name}{cfg}", ms, (lambda a, wgu, mm=mm: mm(a, wgu[:I], wgu[I:]))
     if log:
         log(f"gateup M={M} I={I} K={K}: {best_name} {best_ms * 1000:.1f}us ({2 * I * K * 2 / best_ms / 1e6:.0f} GB/s)")
@@ -643,7 +653,7 @@ def pick_normed(kind: str, x: torch.Tensor, y: torch.Tensor, w_norm: torch.Tenso
                 if log:
                     log(f"normed {name} {cfg} failed: {exc}")
                 continue
-            if ms < best_ms:
+            if ms < best_ms * PICK_MARGIN:
                 best_name, best_ms, best = f"fused-norm {name}{cfg}", ms, fused
     if log:
         log(f"normed {kind} M={M} N={w.shape[0]} K={K}: {best_name} {best_ms * 1000:.1f}us")
