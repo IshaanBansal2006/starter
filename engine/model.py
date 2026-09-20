@@ -159,19 +159,22 @@ def decode_matmuls(m: Model, M: int, log) -> dict[str, object]:
             "lm": unfused,
         }
     if os.environ.get("ENGINE_NORM_FUSED", "1") != "1":
-        qkv, gu, lm = pick_matmul(x, layer.wqkv, log), pick_gateup(x, layer.wgu, log), pick_matmul(x, m.lm_head, log)
+        L = m.layers
+        qkv, gu, lm = (pick_matmul(x, layer.wqkv, log, ws=[l.wqkv for l in L]), pick_gateup(x, layer.wgu, log, ws=[l.wgu for l in L]),
+                       pick_matmul(x, m.lm_head, log))
         return {
             "qkv": lambda x, y, wn, xout, w: qkv(add_rms_norm(x, y, wn, cfg.eps, xout), w),
-            "o": pick_matmul(a, layer.wo, log),
+            "o": pick_matmul(a, layer.wo, log, ws=[l.wo for l in L]),
             "gu": lambda x, y, wn, xout, w: gu(add_rms_norm(x, y, wn, cfg.eps, xout), w),
-            "d": pick_matmul(act, layer.wd, log),
+            "d": pick_matmul(act, layer.wd, log, ws=[l.wd for l in L]),
             "lm": lambda x, y, wn, xout, w: lm(add_rms_norm(x, y, wn, cfg.eps, xout), w),
         }
+    L = m.layers
     return {
-        "qkv": pick_normed("matmul", x, y, layer.in_norm, layer.wqkv, cfg.eps, log),
-        "o": pick_matmul(a, layer.wo, log),
-        "gu": pick_normed("gateup", x, y, layer.post_norm, layer.wgu, cfg.eps, log),
-        "d": pick_matmul(act, layer.wd, log),
+        "qkv": pick_normed("matmul", x, y, layer.in_norm, layer.wqkv, cfg.eps, log, ws=[l.wqkv for l in L]),
+        "o": pick_matmul(a, layer.wo, log, ws=[l.wo for l in L]),
+        "gu": pick_normed("gateup", x, y, layer.post_norm, layer.wgu, cfg.eps, log, ws=[l.wgu for l in L]),
+        "d": pick_matmul(act, layer.wd, log, ws=[l.wd for l in L]),
         "lm": pick_normed("matmul", x, y, m.final_norm, m.lm_head, cfg.eps, log),
     }
 
