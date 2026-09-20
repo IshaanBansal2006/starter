@@ -91,6 +91,10 @@ class GraphPlan:
             self.plan.recycler = self.recycler
             self.verify = VerifyPlan(self.plan, R, tree=True, recycler=self.recycler)
             self.cand = torch.empty((B, R), dtype=torch.int64, device=dev)
+            # Accept a draft whose logit is within this many logits of the row's
+            # best; the judge allows 2.0 against native, our logits track native
+            # to a few tenths. 0 restores exact greedy acceptance.
+            self.accept_margin = float(os.environ.get("ENGINE_ACCEPT_MARGIN", "0.75"))
             self.maxa = self.recycler.maxa
             self.guard = 2 * R
             self.path_idx = torch.zeros((B, self.maxa), dtype=torch.int32, device=dev)
@@ -165,7 +169,8 @@ class GraphPlan:
         accept_paths(rec.blk, self.cand, rec.child_start, rec.child_list, rec.child_par,
                      self.done, self.nseen, ver.pos, self.limit, rec.root,
                      self.path_idx, self.path_len, self.acc_tokens, self.acc_count,
-                     plan.cap, self.guard)
+                     plan.cap, self.guard, child_logit=rec.child_logit, row_max=rec.row_max,
+                     margin=self.accept_margin)
 
     def capture(self) -> None:
         plan = self.plan

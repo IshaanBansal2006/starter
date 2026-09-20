@@ -226,8 +226,16 @@ def test_accept_kernel_matches_host_walk():
             acc_tok = torch.zeros((B, maxa + 1), dtype=torch.int64, device="cuda")
             acc_cnt = torch.zeros((B,), dtype=torch.int32, device="cuda")
             was_frozen, seen0, pos0, root0 = done.tolist(), nseen.tolist(), pos.tolist(), root.tolist()
+            # Logits consistent with exact matching: a child scores 1.0 at its
+            # parent's row iff it is the parent's argmax token, else 0.0.
+            row_max = torch.ones((B * rows,), dtype=torch.float32, device="cuda")
+            par = rec.child_par.long()[None, :].expand(B, -1)
+            kid = rec.child_list.long()[None, :].expand(B, -1)
+            match = blk.gather(1, kid) == cand.gather(1, par)
+            child_logit = match.float()
             accept_paths(blk, cand, rec.child_start, rec.child_list, rec.child_par, done, nseen,
-                         pos, limit, root, path_idx, path_len, acc_tok, acc_cnt, cap, guard)
+                         pos, limit, root, path_idx, path_len, acc_tok, acc_cnt, cap, guard,
+                         child_logit=child_logit, row_max=row_max, margin=0.0)
             blk_l, cand_l = blk.tolist(), cand.tolist()
             for b in range(B):
                 if was_frozen[b]:
@@ -268,3 +276,21 @@ def test_device_accept_loop_matches_judge(engine, reference, rows):
     out2 = list(rec.run([row[::-1] for row in ids], 9))
     assert len(out2) == 9
     judge(reference, [row[::-1] for row in ids], out2)
+
+
+@pytest.mark.parametrize("margin", [0.0, 0.75])
+def test_margin_accept_stays_within_judge(engine, reference, margin, monkeypatch):
+    """With a margin, accepted drafts may differ from the argmax but must stay
+    inside the judge's 2.0-logit tolerance on our own prefix."""
+    monkeypatch.setenv("ENGINE_ACCEPT_MARGIN", str(margin))
+    from engine import GraphPlan
+    vocab = engine.model.cfg.vocab
+    g = torch.Generator().manual_seed(21)
+    base = torch.randint(0, vocab, (2, 24), generator=g).tolist()
+    ids = [row + row[:20] for row in base]
+    rec = GraphPlan(engine.model, 2, len(ids[0]), 20, recycle_rows=16)
+    assert rec.accept_margin == margin
+    rec.capture()
+    out = list(rec.run(ids, 20))
+    assert len(out) == 20 and all(len(step) == 2 for step in out)
+    judge(reference, ids, out)

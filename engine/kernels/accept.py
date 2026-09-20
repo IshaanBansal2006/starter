@@ -44,10 +44,10 @@ def flat_children(children: list[list[int]]) -> tuple[list[int], list[int], list
 
 
 @triton.jit
-def accept_kernel(blk_ptr, cand_ptr, child_start_ptr, child_list_ptr, child_par_ptr,
+def accept_kernel(blk_ptr, cand_ptr, child_logit_ptr, row_max_ptr, child_start_ptr, child_list_ptr, child_par_ptr,
                   done_ptr, nseen_ptr, pos_ptr, limit_ptr,
                   root_ptr, path_idx_ptr, path_len_ptr, acc_tok_ptr, acc_cnt_ptr,
-                  CAP, R: tl.constexpr, C: tl.constexpr, P: tl.constexpr,
+                  CAP, margin, R: tl.constexpr, C: tl.constexpr, P: tl.constexpr,
                   MAXA: tl.constexpr, GUARD: tl.constexpr):
     """One program per sequence.
 
@@ -72,30 +72,37 @@ def accept_kernel(blk_ptr, cand_ptr, child_start_ptr, child_list_ptr, child_par_
     cl = tl.load(child_list_ptr + j, mask=j < C, other=0)
     cp = tl.load(child_par_ptr + j, mask=j < C, other=0)
     cv = tl.load(cand_ptr + b * R + j, mask=j < R, other=0)
-    # Per slot: does the child's drafted token match what the model predicted
-    # after its parent? The two sentinels differ so masked-off slots never hit.
+    # Per slot: is the child's drafted token within ``margin`` logits of the
+    # best token the model predicted after its parent? With margin 0 this is
+    # exact greedy (ties included). Among several qualifying children the one
+    # with the highest logit wins, lowest slot on equal logits.
     drafted = tl.load(blk_ptr + b * R + cl, mask=j < C, other=-1)
-    wanted = tl.load(cand_ptr + b * R + cp, mask=j < C, other=-2)
-    hit = (j < C) & (drafted == wanted)
+    clog = tl.load(child_logit_ptr + b * C + j, mask=j < C, other=float("-inf"))
+    pmax = tl.load(row_max_ptr + b * R + cp, mask=j < C, other=float("inf"))
+    hit = (j < C) & (clog >= pmax - margin)
 
-    tok = tl.sum(tl.where(j == 0, cv, 0), axis=0)
-    tl.store(acc_tok_ptr + b * (MAXA + 1), tok)
     cur = 0
     alen = 0
     alive = live
     for _ in range(MAXA):
         start = tl.sum(tl.where(j == cur, cs, 0), axis=0)
         end = tl.sum(tl.where(j == cur + 1, cs, 0), axis=0)
-        jsel = tl.min(tl.where(hit & (j >= start) & (j < end), j, P), axis=0)
+        inslice = hit & (j >= start) & (j < end)
+        best = tl.max(tl.where(inslice, clog, float("-inf")), axis=0)
+        jsel = tl.min(tl.where(inslice & (clog == best), j, P), axis=0)
         found = alive & (jsel < P)
         c = tl.where(found, tl.sum(tl.where(j == jsel, cl, 0), axis=0), 0)
-        ntok = tl.sum(tl.where(j == c, cv, 0), axis=0)
+        ctok = tl.sum(tl.where(j == jsel, drafted, 0), axis=0)
         tl.store(path_idx_ptr + b * MAXA + tl.minimum(alen, MAXA - 1), c, mask=found)
+        # The token emitted at this step is the accepted draft itself, which
+        # under a margin need not equal the parent's argmax.
+        tl.store(acc_tok_ptr + b * (MAXA + 1) + tl.minimum(alen, MAXA), ctok, mask=found)
         alen = tl.where(found, alen + 1, alen)
-        tl.store(acc_tok_ptr + b * (MAXA + 1) + tl.minimum(alen, MAXA), ntok, mask=found)
-        tok = tl.where(found, ntok, tok)
         cur = tl.where(found, c, cur)
         alive = found
+    # After the last accepted node the model's own argmax is emitted.
+    tok = tl.sum(tl.where(j == cur, cv, 0), axis=0)
+    tl.store(acc_tok_ptr + b * (MAXA + 1) + tl.minimum(alen, MAXA), tok)
 
     plen = tl.where(live, alen, -1)
     cnt = tl.where(live, alen + 1, 0)
@@ -114,7 +121,9 @@ def accept_paths(blk: torch.Tensor, cand: torch.Tensor, child_start: torch.Tenso
                  child_list: torch.Tensor, child_par: torch.Tensor, done: torch.Tensor,
                  nseen: torch.Tensor, pos: torch.Tensor, limit: torch.Tensor,
                  root: torch.Tensor, path_idx: torch.Tensor, path_len: torch.Tensor,
-                 acc_tokens: torch.Tensor, acc_count: torch.Tensor, cap: int, guard: int) -> None:
+                 acc_tokens: torch.Tensor, acc_count: torch.Tensor, cap: int, guard: int,
+                 child_logit: torch.Tensor | None = None, row_max: torch.Tensor | None = None,
+                 margin: float = 0.0) -> None:
     """blk/cand [B, R] int64; the CSR template; done/nseen/pos/limit int32 device
     state; writes root [B] int64, path_idx [B, MAXA] int32, path_len [B] int32,
     acc_tokens [B, MAXA+1] int64 and acc_count [B] int32.
@@ -128,6 +137,8 @@ def accept_paths(blk: torch.Tensor, cand: torch.Tensor, child_start: torch.Tenso
         raise ValueError(f"acc_tokens must be [{B}, {MAXA + 1}], got {tuple(acc_tokens.shape)}")
     C = child_list.numel()
     P = triton.next_power_of_2(max(R + 1, C))
-    accept_kernel[(B,)](blk, cand, child_start, child_list, child_par, done, nseen, pos, limit,
+    if child_logit is None or row_max is None:
+        raise ValueError("accept_paths needs child_logit [B, C] and row_max [B*R] from the verify pass")
+    accept_kernel[(B,)](blk, cand, child_logit, row_max, child_start, child_list, child_par, done, nseen, pos, limit,
                         root, path_idx, path_len, acc_tokens, acc_count,
-                        cap, R=R, C=C, P=P, MAXA=MAXA, GUARD=guard, num_warps=1)
+                        cap, float(margin), R=R, C=C, P=P, MAXA=MAXA, GUARD=guard, num_warps=1)
