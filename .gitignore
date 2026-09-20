@@ -9,3 +9,4 @@ __pycache__/
 explanations/
 .pytest_cache/
 .ruff_cache/
+.gstack/

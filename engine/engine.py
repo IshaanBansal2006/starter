@@ -35,12 +35,24 @@ _ensure_triton_cache()
 
 import torch
 
+try:
+    import numpy as np
+except ImportError:  # the container ships numpy with transformers; this only keeps the engine importable without it
+    np = None
+
 from model import Model, Plan, VerifyPlan
 from spec import NGramDrafter
 
 
 def _log(msg: str) -> None:
     print(f"[engine] {msg}", file=sys.stderr, flush=True)
+
+
+def _ids_tensor(input_ids: list[list[int]]) -> torch.Tensor:
+    """Nested-list to int64 tensor; numpy walks the lists several times faster than torch.tensor."""
+    if np is not None:
+        return torch.from_numpy(np.asarray(input_ids, dtype=np.int64))
+    return torch.tensor(input_ids, dtype=torch.int64)
 
 
 class GraphPlan:
@@ -118,7 +130,7 @@ class GraphPlan:
         plain greedy decode because only model-predicted tokens are kept."""
         plan, ver = self.plan, self.verify
         B, K, R = self.B, self.spec_k, self.verify.R
-        plan.ids.copy_(torch.tensor(input_ids, dtype=torch.int64))
+        plan.ids.copy_(_ids_tensor(input_ids))
         self._step_prefill()
         first = plan.tok.tolist()
         yield first
@@ -168,7 +180,7 @@ class GraphPlan:
             yield from self.run_spec(input_ids, max_new_tokens)
             return
         plan = self.plan
-        plan.ids.copy_(torch.tensor(input_ids, dtype=torch.int64), non_blocking=False)
+        plan.ids.copy_(_ids_tensor(input_ids))
         host = self.host_tok
         events = self.events
         self._step_prefill()
@@ -211,7 +223,12 @@ class Engine:
             spec_k = self.spec_k if self.spec_k and B * (self.spec_k + 1) <= self.spec_max_rows else None
             plan = GraphPlan(self.model, B, T, max_new, spec_k=spec_k)
             if self.use_graphs:
-                plan.capture()
+                try:
+                    plan.capture()
+                except Exception as exc:  # eager execution is slower but produces the same tokens
+                    _log(f"CUDA graph capture failed ({exc!r}); running eagerly")
+                    plan.g_prefill = plan.g_decode = plan.g_verify = None
+                    torch.cuda.synchronize()
             self.plans[key] = plan
         return plan
 
