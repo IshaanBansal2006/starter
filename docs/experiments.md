@@ -140,3 +140,15 @@ score: None  failure: candidate_error The model benchmark could not complete; de
 
 | workload | status | tok/s | speedup | ttft ratio | tpot ratio | message |
 |---|---|---:|---:|---:|---:|---|
+
+## 2026-09-20 05:11 UTC — official run `19001d22-f5e5-4d33-b743-c74935d86340` @ `9ca99c0` — succeeded
+
+commit a853c8b
+
+score: 1085.2874764441376  failure:  
+
+| workload | status | tok/s | speedup | ttft ratio | tpot ratio | message |
+|---|---|---:|---:|---:|---:|---|
+| public-0 | passed | 369.9 | 6.63x | 0.54 | 0.14 |  |
+| public-1 | passed | 460.9 | 3.04x | 0.70 | 0.21 |  |
+| public-2 | passed | 3003.7 | 4.50x | 0.68 | 0.19 |  |
