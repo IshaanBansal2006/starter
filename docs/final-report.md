@@ -51,7 +51,10 @@ smaller batch-1 trees (−4%), margin acceptance of near-tie drafts (−2 to −
 picker hysteresis (−2%), three extra large GEMM tiles (−2% on the hidden set), cuDNN prefill
 attention (no change), 64-row attention blocks (crashed on Hopper), 32-row M-tiled GEMMs
 (streamed weights twice), removing the round floors (1212, neutral: the natural batch-1 median
-is ~13 rounds, and the spread gate accepted a 24% p10-p90 range).
+is ~13 rounds, and the spread gate accepted a 24% p10-p90 range), a 12-rank draft table (1179-1193).
+
+Final standing at the deadline (07:25 EDT, 2026-09-20): **rank 4 of 58 at 1230.4 tok/s**
+(1432 / 1258 / 1232 above). `main` is restored to the best-scoring configuration.
 
 ## Where the remaining time goes
 
