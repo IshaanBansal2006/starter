@@ -41,6 +41,18 @@ class TreeTemplate:
         return out
 
     @property
+    def spine(self) -> list[int]:
+        """Nodes on the rank-0 path from the root (depth 1, 2, ...): the chain
+        that an n-gram continuation overrides when it has a confident match."""
+        nodes, cur = [], 0
+        while True:
+            nxt = [c for c in self.children[cur] if self.rank[c] == 0]
+            if not nxt:
+                return nodes
+            cur = nxt[0]
+            nodes.append(cur)
+
+    @property
     def size(self) -> int:
         return len(self.parent)
 
@@ -67,7 +79,11 @@ class TreeTemplate:
 
 
 @triton.jit
-def _draft_kernel(root_ptr, table_ptr, parent_ptr, rank_ptr, blk_ptr, K: tl.constexpr, R: tl.constexpr):
+def _draft_kernel(root_ptr, table_ptr, parent_ptr, rank_ptr, spine_slot_ptr, spine_ptr, blk_ptr,
+                  K: tl.constexpr, R: tl.constexpr, S: tl.constexpr):
+    """Nodes are filled in index order (parents first). A node on the spine takes
+    the host's n-gram token when one is present (>= 0); every other node takes
+    table[token(parent)][rank], so branches always hang off the current token."""
     b = tl.program_id(0)
     tok = tl.load(root_ptr + b)
     tl.store(blk_ptr + b * R, tok)
@@ -75,8 +91,11 @@ def _draft_kernel(root_ptr, table_ptr, parent_ptr, rank_ptr, blk_ptr, K: tl.cons
         p = tl.load(parent_ptr + i)
         r = tl.load(rank_ptr + i)
         ptok = tl.load(blk_ptr + b * R + p)
-        cand = tl.load(table_ptr + ptok * K + r)
-        tl.store(blk_ptr + b * R + i, tl.maximum(cand, 0))
+        cand = tl.maximum(tl.load(table_ptr + ptok * K + r), 0)
+        slot = tl.load(spine_slot_ptr + i)
+        sp = tl.load(spine_ptr + b * S + tl.maximum(slot, 0))
+        use_spine = (slot >= 0) & (sp >= 0)
+        tl.store(blk_ptr + b * R + i, tl.where(use_spine, sp, cand))
 
 
 class Recycler:
@@ -92,6 +111,13 @@ class Recycler:
         self.depth = torch.tensor(self.template.depth, dtype=torch.int32, device=device)
         self.root = torch.zeros((B,), dtype=torch.int64, device=device)
         self.blk = torch.zeros((B, R), dtype=torch.int64, device=device)
+        spine_nodes = self.template.spine
+        self.S = max(1, len(spine_nodes))
+        slot = [-1] * R
+        for j, node in enumerate(spine_nodes):
+            slot[node] = j
+        self.spine_slot = torch.tensor(slot, dtype=torch.int32, device=device)
+        self.spine = torch.full((B, self.S), -1, dtype=torch.int64, device=device)
 
     def update(self, tokens: torch.Tensor, logits: torch.Tensor) -> None:
         """Record the top-k next tokens predicted after each of ``tokens`` ([N] int64, logits [N, V])."""
@@ -100,7 +126,8 @@ class Recycler:
 
     def draft(self) -> None:
         """Fill ``blk`` from ``root`` by walking the template through the table."""
-        _draft_kernel[(self.B,)](self.root, self.table, self.parent, self.rank, self.blk, K=self.k, R=self.R)
+        _draft_kernel[(self.B,)](self.root, self.table, self.parent, self.rank, self.spine_slot, self.spine, self.blk,
+                                 K=self.k, R=self.R, S=self.S)
 
     def accept(self, blk_row: list[int], cand_row: list[int]) -> tuple[list[int], list[int]]:
         """Longest verified path: returns (accepted tokens, block indices of the accepted nodes)."""

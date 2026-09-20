@@ -99,6 +99,8 @@ class GraphPlan:
             self.host_path_idx = torch.zeros((B, self.maxa), dtype=torch.int32, pin_memory=True)
             self.host_path_len = torch.zeros((B,), dtype=torch.int32, pin_memory=True)
             self.host_root = torch.zeros((B,), dtype=torch.int64, pin_memory=True)
+            self.host_spine = torch.full((B, self.recycler.S), -1, dtype=torch.int64, pin_memory=True)
+            self.spine_min_match = int(os.environ.get("ENGINE_SPINE_MIN_MATCH", "3"))
         elif spec_k:
             self.verify = VerifyPlan(self.plan, spec_k + 1)
             self.cand = torch.empty((B, spec_k + 1), dtype=torch.int64, device=dev)
@@ -190,6 +192,14 @@ class GraphPlan:
         self.host_path_len.zero_()
         rec.root.copy_(self.host_root, non_blocking=True)
         self.path_len.copy_(self.host_path_len, non_blocking=True)
+        S = rec.S
+        drafters = [NGramDrafter(input_ids[b] + [first[b]], S, max_n=4, min_n=self.spine_min_match) for b in range(B)]
+        self.host_spine.fill_(-1)
+        for b in range(B):
+            sp = drafters[b].draft_or_none()
+            if sp:
+                self.host_spine[b, :len(sp)] = torch.tensor(sp)
+        rec.spine.copy_(self.host_spine, non_blocking=True)
         rounds = accepted = 0
         min_rounds = math.ceil((max_new_tokens - 1) / self.tau_floor) if max_new_tokens > 1 else 0
         while yielded < max_new_tokens:
@@ -211,10 +221,19 @@ class GraphPlan:
                     lens.append(-1); idxs.append([0] * self.maxa); roots.append(queues[b][-1]); continue
                 toks, path = rec.accept(blk[b], cand[b])
                 queues[b].extend(toks)
+                drafters[b].extend(toks)
                 accepted += len(path)
                 lens.append(len(path))
                 idxs.append(path + [0] * (self.maxa - len(path)))
                 roots.append(toks[-1])
+            self.host_spine.fill_(-1)
+            for b in range(B):
+                if len(queues[b]) >= max_new_tokens:
+                    continue
+                sp = drafters[b].draft_or_none()
+                if sp:
+                    self.host_spine[b, :len(sp)] = torch.tensor(sp)
+            rec.spine.copy_(self.host_spine, non_blocking=True)
             self.host_path_len.copy_(torch.tensor(lens, dtype=torch.int32))
             self.host_path_idx.copy_(torch.tensor(idxs, dtype=torch.int32))
             self.host_root.copy_(torch.tensor(roots, dtype=torch.int64))
