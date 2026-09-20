@@ -35,3 +35,15 @@ run on the change.
 ## Leaderboard snapshot 2026-09-19 23:25 EDT
 
 Top: Segfault 1280.4 tok/s; places 2-5 at 1137-1144; 56 ranked teams.
+
+## 2026-09-20 03:33 UTC — official run `f0f62422-9c3b-4476-98e1-7d7a73826f1d` @ `ae33a6e` — succeeded
+
+v1 default config, first run on the H100 (push-created submission)
+
+score: 763.5456265036153  failure:  
+
+| workload | status | tok/s | speedup | ttft ratio | tpot ratio | message |
+|---|---|---:|---:|---:|---:|---|
+| public-0 | passed | 201.0 | 4.42x | 0.44 | 0.22 |  |
+| public-1 | passed | 415.5 | 3.02x | 0.62 | 0.25 |  |
+| public-2 | passed | 2468.4 | 3.80x | 0.59 | 0.24 |  |
