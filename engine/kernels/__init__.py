@@ -1,6 +1,6 @@
-"""Modules your engine imports, vendored beside ``engine.py``.
+from kernels.attention import DecodeAttention
+from kernels.rmsnorm import rms_norm
+from kernels.rope import qk_norm_rope_cache
+from kernels.swiglu import swiglu
 
-The archive root is on ``sys.path``, so this package is importable by name —
-``from kernels.rmsnorm import rms_norm`` — as long as ``kernels/`` ships inside
-the archive. Nothing here is imported by the baseline engine.
-"""
+__all__ = ["DecodeAttention", "rms_norm", "qk_norm_rope_cache", "swiglu"]

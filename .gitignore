@@ -6,3 +6,6 @@ __pycache__/
 !.env.example
 *.tar.gz
 .DS_Store
+explanations/
+.pytest_cache/
+.ruff_cache/

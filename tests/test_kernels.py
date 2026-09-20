@@ -1,0 +1,87 @@
+"""Kernel-level checks against the reference formulas at the real head width."""
+
+from __future__ import annotations
+
+import torch
+import torch.nn.functional as F
+
+torch.backends.cuda.matmul.allow_tf32 = False
+
+
+def ref_rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
+    h = x.float()
+    h = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + eps)
+    return w * h.to(x.dtype)
+
+
+def rotate_half(x):
+    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2:]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def test_swiglu_matches_reference():
+    from kernels import swiglu
+    gu = torch.randn(37, 2 * 9728, device="cuda", dtype=torch.bfloat16) * 3
+    g, u = gu[:, :9728], gu[:, 9728:]
+    ref = F.silu(g) * u
+    assert torch.equal(swiglu(gu), ref)
+
+
+def test_rope_cache_matches_reference():
+    from kernels import qk_norm_rope_cache
+    from model import Config, rope_tables
+    B, T, HQ, HKV, D, CAP = 2, 5, 8, 2, 128, 9
+    cfg = Config(hidden=0, intermediate=0, layers=0, heads=HQ, kv_heads=HKV, head_dim=D, vocab=0, eps=1e-6, rope_theta=5e6, tie_embeddings=True)
+    cos, sin = rope_tables(cfg, CAP, "cuda")
+    qkv = torch.randn(B * T, (HQ + 2 * HKV) * D, device="cuda", dtype=torch.bfloat16)
+    qw = 1 + 0.1 * torch.randn(D, device="cuda", dtype=torch.bfloat16)
+    kw = 1 + 0.1 * torch.randn(D, device="cuda", dtype=torch.bfloat16)
+    start = 3
+    pos = torch.full((B,), start, dtype=torch.int32, device="cuda")
+    q_out = torch.empty(B, HQ, T, D, device="cuda", dtype=torch.bfloat16)
+    kc = torch.zeros(B, HKV, CAP, D, device="cuda", dtype=torch.bfloat16)
+    vc = torch.zeros_like(kc)
+    qk_norm_rope_cache(qkv, qw, kw, cos, sin, pos, q_out, kc, vc, T, 1e-6)
+
+    q = qkv[:, : HQ * D].view(B, T, HQ, D)
+    k = qkv[:, HQ * D:(HQ + HKV) * D].view(B, T, HKV, D)
+    v = qkv[:, (HQ + HKV) * D:].view(B, T, HKV, D)
+    c = cos[start:start + T][None, :, None, :]
+    s = sin[start:start + T][None, :, None, :]
+    qn, kn = ref_rmsnorm(q, qw, 1e-6), ref_rmsnorm(k, kw, 1e-6)
+    q_ref = ((qn * c) + (rotate_half(qn) * s)).transpose(1, 2)
+    k_ref = ((kn * c) + (rotate_half(kn) * s)).transpose(1, 2)
+    assert torch.equal(q_out, q_ref)
+    assert torch.equal(kc[:, :, start:start + T], k_ref)
+    assert torch.equal(vc[:, :, start:start + T], v.transpose(1, 2))
+    assert torch.all(kc[:, :, :start] == 0) and torch.all(kc[:, :, start + T:] == 0)
+
+
+def test_decode_attention_matches_sdpa():
+    from kernels import DecodeAttention
+    B, HQ, HKV, D, CAP = 3, 8, 2, 128, 200
+    lengths = torch.tensor([200, 1, 77], dtype=torch.int32, device="cuda")
+    q = torch.randn(B, HQ, D, device="cuda", dtype=torch.bfloat16)
+    kc = torch.randn(B, HKV, CAP, D, device="cuda", dtype=torch.bfloat16)
+    vc = torch.randn(B, HKV, CAP, D, device="cuda", dtype=torch.bfloat16)
+    out = torch.empty_like(q)
+    for nsplit in (1, 4):
+        attn = DecodeAttention(B, HQ, HKV, D, CAP, "cuda", nsplit=nsplit)
+        attn(q, kc, vc, lengths - 1, out)
+        for b in range(B):
+            L = int(lengths[b])
+            k = kc[b, :, :L].repeat_interleave(HQ // HKV, dim=0)
+            v = vc[b, :, :L].repeat_interleave(HQ // HKV, dim=0)
+            ref = F.scaled_dot_product_attention(q[b, :, None], k, v, scale=D ** -0.5)[:, 0]
+            err = (out[b].float() - ref.float()).abs().max().item()
+            assert err < 2e-2, f"nsplit={nsplit} b={b}: {err}"
+
+
+def test_sdpa_gqa_bitwise_equals_repeat_kv():
+    B, HQ, HKV, T, D = 2, 8, 2, 64, 128
+    q = torch.randn(B, HQ, T, D, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(B, HKV, T, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(B, HKV, T, D, device="cuda", dtype=torch.bfloat16)
+    a = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=D ** -0.5, enable_gqa=True)
+    b = F.scaled_dot_product_attention(q, k.repeat_interleave(4, 1), v.repeat_interleave(4, 1), is_causal=True, scale=D ** -0.5)
+    assert torch.equal(a, b)
