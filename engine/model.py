@@ -254,7 +254,7 @@ class Plan:
         if os.environ.get("ENGINE_ATTN_DEFAULT") == "1":
             self.attention = DecodeAttention(B, HQ, HKV, D, self.cap, dev)
         else:
-                self.attention = pick_attention(B, HQ, HKV, D, self.cap, T + max_new // 2, dev, log, maxlen=T + max_new + 64)
+                self.attention = pick_attention(B, HQ, HKV, D, self.cap, T + max_new // 2, dev, log, maxlen=self.cap)
         self.mm = self._pick_decode_matmuls()
         self.recycler = None
 
@@ -356,7 +356,7 @@ class VerifyPlan:
         self.attn_out = torch.empty((B, R, HQ, D), dtype=bf16, device=dev)
         log = lambda s: print(f"[engine] {s}", file=sys.stderr, flush=True)
         self.attention = pick_attention(B, HQ, HKV, D, plan.cap, plan.T + plan.max_new // 2, dev, log, R=R, tree=tree,
-                                        maxlen=plan.T + plan.max_new + R + 64)
+                                        maxlen=plan.cap)
         self.mm = decode_matmuls(m, B * R, log)
 
     @torch.inference_mode()

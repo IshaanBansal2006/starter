@@ -110,7 +110,7 @@ def _fits(fn):
 
 def test_skinny_matmul_configs_match_cublas():
     from kernels.gemm import CONFIGS, SkinnyMatmul
-    for M in (1, 4, 16):
+    for M in (1, 4, 16, 48, 128):
         for N, K in ((6144, 2560), (2560, 9728), (777, 2560)):
             a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
             w = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.02
@@ -170,7 +170,7 @@ def test_norm_prologue_matches_add_norm_then_gemm():
     from kernels import add_rms_norm
     from kernels.gemm import CONFIGS, SkinnyGateUp, SkinnyMatmul
     torch.manual_seed(0)
-    for M in (1, 5, 16):
+    for M in (1, 5, 16, 64, 96):
         K, N, I = 2560, 1536, 1024
         x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
         y = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)

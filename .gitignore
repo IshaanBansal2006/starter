@@ -10,3 +10,5 @@ explanations/
 .pytest_cache/
 .ruff_cache/
 .gstack/
+.claude/worktrees/
+.cache/

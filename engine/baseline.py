@@ -25,6 +25,11 @@ class BaselineEngine:
         full [B, T, V] tensor would be gigabytes at batch 16)."""
         return self.model(input_ids=input_ids, use_cache=False, logits_to_keep=1, return_dict=True).logits[:, -1].float().clone()
 
+    def continue_from(self, prefix: list[list[int]], steps: int):
+        """Greedy continuation of an already-emitted prefix: the caller's own
+        tokens are the context, so a resumed sample stays a single trajectory."""
+        yield from self.generate(prefix, steps)
+
     def generate(self, input_ids: list[list[int]], max_new_tokens: int):
         current = torch.tensor(input_ids, dtype=torch.int64, device="cuda:0")
         cache = None
