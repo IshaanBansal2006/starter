@@ -85,3 +85,28 @@ def test_sdpa_gqa_bitwise_equals_repeat_kv():
     a = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=D ** -0.5, enable_gqa=True)
     b = F.scaled_dot_product_attention(q, k.repeat_interleave(4, 1), v.repeat_interleave(4, 1), is_causal=True, scale=D ** -0.5)
     assert torch.equal(a, b)
+
+
+def test_add_rms_norm_matches_reference():
+    from kernels import add_rms_norm
+    x = torch.randn(9, 2560, device="cuda", dtype=torch.bfloat16)
+    y = torch.randn(9, 2560, device="cuda", dtype=torch.bfloat16)
+    w = 1 + 0.1 * torch.randn(2560, device="cuda", dtype=torch.bfloat16)
+    x_ref = x + y
+    h_ref = ref_rmsnorm(x_ref, w, 1e-6)
+    h = add_rms_norm(x, y, w, 1e-6)
+    assert torch.equal(x, x_ref)
+    assert torch.equal(h, h_ref)
+
+
+def test_skinny_matmul_configs_match_cublas():
+    from kernels.gemm import CONFIGS, SkinnyMatmul
+    for M in (1, 4, 16):
+        for N, K in ((6144, 2560), (2560, 9728), (777, 2560)):
+            a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+            w = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.02
+            ref = (a @ w.t()).float()
+            for cfg in CONFIGS:
+                out = SkinnyMatmul(M, N, K, a.device, **cfg)(a, w).float()
+                err = (out - ref).abs().max().item()
+                assert err <= 0.02 * ref.abs().max().item() + 1e-3, (M, N, K, cfg, err)
