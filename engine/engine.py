@@ -43,6 +43,11 @@ except ImportError:  # the container ships numpy with transformers; this only ke
 from model import Model, Plan, VerifyPlan
 from spec import NGramDrafter
 
+SELF_CHECK_STEPS = 6
+SELF_CHECK_TOPK = 10
+SELF_CHECK_MAX_DIFF = 2.0
+TIE_MARGIN = 2.0
+
 
 def _log(msg: str) -> None:
     print(f"[engine] {msg}", file=sys.stderr, flush=True)
@@ -199,17 +204,81 @@ class GraphPlan:
 
 
 class Engine:
+    """Custom engine with a native safety net.
+
+    If loading the custom model fails, or the warmup self-check finds the custom
+    forward disagreeing with Transformers beyond the tie margin, every call is
+    served by the organizers' baseline instead. Slower, never wrong.
+    """
+
     def __init__(self, model_path: str) -> None:
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
-        t0 = time.perf_counter()
-        self.model = Model(model_path)
-        torch.cuda.synchronize()
-        _log(f"loaded {model_path} in {time.perf_counter() - t0:.1f}s")
+        self.model_path = model_path
+        self.fallback = None
+        self.model = None
         self.plans: dict[tuple[int, int], GraphPlan] = {}
         self.use_graphs = os.environ.get("ENGINE_NO_GRAPHS") is None
         self.spec_k = int(os.environ.get("ENGINE_SPEC_K", "0")) or None
         self.spec_max_rows = int(os.environ.get("ENGINE_SPEC_MAX_ROWS", "64"))
+        self.self_check = os.environ.get("ENGINE_SELF_CHECK", "1") == "1"
+        self.checked = False
+        t0 = time.perf_counter()
+        try:
+            self.model = Model(model_path)
+            torch.cuda.synchronize()
+            _log(f"loaded {model_path} in {time.perf_counter() - t0:.1f}s")
+        except Exception as exc:
+            _log(f"custom model load failed ({exc!r}); using the native baseline for this run")
+            self._use_fallback()
+
+    def _use_fallback(self) -> None:
+        from baseline import BaselineEngine
+
+        self.plans.clear()
+        self.model = None
+        torch.cuda.empty_cache()
+        self.fallback = BaselineEngine(self.model_path)
+
+    def _run_self_check(self, plan: GraphPlan, input_ids: list[list[int]]) -> None:
+        """Teacher-forced comparison against Transformers on the warmup prompt.
+
+        Runs once, untimed, inside the load budget. Every checked position must
+        keep our greedy token within the judge's tie margin of the reference
+        argmax, and the reference's top-10 logits must agree to within that
+        same margin (a real kernel bug moves them by tens).
+        """
+        from baseline import BaselineEngine
+
+        t0 = time.perf_counter()
+        ref = BaselineEngine(self.model_path)
+        B, T = len(input_ids), len(input_ids[0])
+        steps = min(SELF_CHECK_STEPS, plan.plan.cap - T)
+        seq = torch.tensor(input_ids, dtype=torch.int64, device=self.model.device)
+        worst_diff, worst_gap = 0.0, 0.0
+        p = plan.plan
+        p.ids.copy_(seq)
+        mine = p.prefill().float()
+        for step in range(steps):
+            ref_logits = ref.logits(seq)[:, -1]
+            top = ref_logits.max(dim=-1).values
+            my_tok = mine.argmax(dim=-1)
+            gap = (top - ref_logits.gather(1, my_tok[:, None])[:, 0]).max().item()
+            top_idx = ref_logits.topk(SELF_CHECK_TOPK, dim=-1).indices
+            diff = (mine.gather(1, top_idx) - ref_logits.gather(1, top_idx)).abs().max().item()
+            worst_diff, worst_gap = max(worst_diff, diff), max(worst_gap, gap)
+            forced = ref_logits.argmax(dim=-1)
+            seq = torch.cat([seq, forced[:, None]], dim=1)
+            if step + 1 < steps:
+                p.tok.copy_(forced)
+                mine = p.decode().float()
+        del ref
+        torch.cuda.empty_cache()
+        ok = worst_gap <= TIE_MARGIN and worst_diff <= SELF_CHECK_MAX_DIFF
+        _log(f"self-check vs transformers over {steps} steps: max|dlogit|={worst_diff:.3f} "
+             f"worst tie gap={worst_gap:.3f} -> {'ok' if ok else 'FAILED'} ({time.perf_counter() - t0:.1f}s)")
+        if not ok:
+            raise RuntimeError("custom engine disagrees with the reference")
 
     def _plan(self, B: int, T: int, max_new: int) -> GraphPlan:
         key = (B, T)
@@ -238,5 +307,16 @@ class Engine:
             raise ValueError("all prompts in a batch must have the same length")
         if max_new_tokens < 1:
             return
-        plan = self._plan(B, T, max_new_tokens)
+        if self.fallback is None:
+            try:
+                plan = self._plan(B, T, max_new_tokens)
+                if self.self_check and not self.checked:
+                    self._run_self_check(plan, input_ids)
+                    self.checked = True
+            except Exception as exc:
+                _log(f"custom engine unusable ({exc!r}); using the native baseline for this run")
+                self._use_fallback()
+        if self.fallback is not None:
+            yield from self.fallback.generate(input_ids, max_new_tokens)
+            return
         yield from plan.run(input_ids, max_new_tokens)
