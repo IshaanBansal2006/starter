@@ -19,7 +19,7 @@ import torch.nn.functional as F
 from safetensors import safe_open
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from kernels import DecodeAttention, add_rms_norm, pick_attention, pick_gateup, pick_matmul, qk_norm_rope_cache, rms_norm, swiglu
+from kernels import DecodeAttention, add_rms_norm, pick_attention, pick_gateup, pick_matmul, pick_normed, qk_norm_rope_cache, rms_norm, swiglu
 
 
 @dataclass(frozen=True)
@@ -134,6 +134,76 @@ class Model:
             self.cos, self.sin = rope_tables(self.cfg, max_pos, self.device)
 
 
+def decode_matmuls(m: Model, M: int, log) -> dict[str, object]:
+    """Per-shape projection callables for M-row decode/verify steps.
+
+    "qkv", "gu" and "lm" take ``(x, y, w_norm, xout, w)`` and fold the residual
+    add and RMSNorm of their input in front of the projection; "o" and "d" are
+    plain ``(a, w)``. Each is the timed winner between cuBLAS pipelines and
+    Triton kernels on this device.
+    """
+    cfg = m.cfg
+    layer = m.layers[0]
+    bf16 = torch.bfloat16
+    x = torch.randn((M, cfg.hidden), dtype=bf16, device=m.device)
+    y = torch.randn((M, cfg.hidden), dtype=bf16, device=m.device)
+    a = torch.randn((M, cfg.heads * cfg.head_dim), dtype=bf16, device=m.device)
+    act = torch.randn((M, cfg.intermediate), dtype=bf16, device=m.device)
+    if os.environ.get("ENGINE_FORCE_CUBLAS") == "1":
+        unfused = lambda x, y, wn, xout, w: add_rms_norm(x, y, wn, cfg.eps, xout) @ w.t()
+        return {
+            "qkv": unfused,
+            "o": lambda a, w: a @ w.t(),
+            "gu": lambda x, y, wn, xout, w: swiglu(add_rms_norm(x, y, wn, cfg.eps, xout) @ w.t()),
+            "d": lambda a, w: a @ w.t(),
+            "lm": unfused,
+        }
+    if os.environ.get("ENGINE_NORM_FUSED", "1") != "1":
+        qkv, gu, lm = pick_matmul(x, layer.wqkv, log), pick_gateup(x, layer.wgu, log), pick_matmul(x, m.lm_head, log)
+        return {
+            "qkv": lambda x, y, wn, xout, w: qkv(add_rms_norm(x, y, wn, cfg.eps, xout), w),
+            "o": pick_matmul(a, layer.wo, log),
+            "gu": lambda x, y, wn, xout, w: gu(add_rms_norm(x, y, wn, cfg.eps, xout), w),
+            "d": pick_matmul(act, layer.wd, log),
+            "lm": lambda x, y, wn, xout, w: lm(add_rms_norm(x, y, wn, cfg.eps, xout), w),
+        }
+    return {
+        "qkv": pick_normed("matmul", x, y, layer.in_norm, layer.wqkv, cfg.eps, log),
+        "o": pick_matmul(a, layer.wo, log),
+        "gu": pick_normed("gateup", x, y, layer.post_norm, layer.wgu, cfg.eps, log),
+        "d": pick_matmul(act, layer.wd, log),
+        "lm": pick_normed("matmul", x, y, m.final_norm, m.lm_head, cfg.eps, log),
+    }
+
+
+def run_layers(plan: "Plan", mm: dict, x: torch.Tensor, q_buf: torch.Tensor, attn_out: torch.Tensor,
+               attention, pos: torch.Tensor, R: int, rope_fused: bool) -> torch.Tensor:
+    """Decode/verify layer stack over ``M = B*R`` rows; returns the logits.
+
+    The residual stream lives in two buffers: every fused norm-prologue GEMM
+    reads one residual and writes the next, and a kernel must never write the
+    buffer its other programs are still reading. QKV reads ``cur`` (the
+    embedding, then always ``xb``) and writes ``xa``; gate/up reads ``xa`` and
+    writes ``xb``; the LM head reads ``xb`` and writes ``xa``.
+    """
+    m, cfg = plan.model, plan.model.cfg
+    B = plan.B
+    HQ, D = cfg.heads, cfg.head_dim
+    zero = torch.zeros_like(x)
+    xa, xb = torch.empty_like(x), torch.empty_like(x)
+    cur, y = x, zero
+    for i, layer in enumerate(m.layers):
+        qkv = mm["qkv"](cur, y, layer.in_norm, xa, layer.wqkv)
+        qk_norm_rope_cache(qkv, layer.q_norm, layer.k_norm, m.cos, m.sin, pos,
+                           q_buf, plan.k_cache[i], plan.v_cache[i], R, cfg.eps, fused=rope_fused)
+        attention(q_buf, plan.k_cache[i], plan.v_cache[i], pos, attn_out)
+        o = mm["o"](attn_out.view(B * R, HQ * D), layer.wo)
+        act = mm["gu"](xa, o, layer.post_norm, xb, layer.wgu)
+        y = mm["d"](act, layer.wd)
+        cur = xb
+    return mm["lm"](cur, y, m.final_norm, xa, m.lm_head)
+
+
 class Plan:
     """Static buffers, KV cache and step functions for one (B, T, max_new) shape."""
 
@@ -185,21 +255,7 @@ class Plan:
         a = torch.randn((B, cfg.heads * cfg.head_dim), dtype=torch.bfloat16, device=m.device)
         act = torch.randn((B, cfg.intermediate), dtype=torch.bfloat16, device=m.device)
         log = lambda s: print(f"[engine] {s}", file=sys.stderr, flush=True)
-        if os.environ.get("ENGINE_FORCE_CUBLAS") == "1":
-            return {
-                "qkv": lambda a, w: a @ w.t(),
-                "o": lambda a, w: a @ w.t(),
-                "gu": lambda a, w: swiglu(a @ w.t()),
-                "d": lambda a, w: a @ w.t(),
-                "lm": lambda a, w: a @ w.t(),
-            }
-        return {
-            "qkv": pick_matmul(x, layer.wqkv, log),
-            "o": pick_matmul(a, layer.wo, log),
-            "gu": pick_gateup(x, layer.wgu, log),
-            "d": pick_matmul(act, layer.wd, log),
-            "lm": pick_matmul(x, m.lm_head, log),
-        }
+        return decode_matmuls(m, B, log)
 
     def _prefill_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         """The reference's own SDPA call (flash, causal) unless ENGINE_PREFILL_SDPA pins a backend."""
@@ -241,19 +297,8 @@ class Plan:
         m, cfg = self.model, self.model.cfg
         B = self.B
         HQ, D = cfg.heads, cfg.head_dim
-        mm = self.mm
         x = F.embedding(self.tok, m.embed)
-        h = rms_norm(x, m.layers[0].in_norm, cfg.eps)
-        for i, layer in enumerate(m.layers):
-            qkv = mm["qkv"](h, layer.wqkv)
-            qk_norm_rope_cache(qkv, layer.q_norm, layer.k_norm, m.cos, m.sin, self.pos,
-                               self.q_decode, self.k_cache[i], self.v_cache[i], 1, cfg.eps, fused=self.rope_fused)
-            self.attention(self.q_decode, self.k_cache[i], self.v_cache[i], self.pos, self.attn_decode)
-            o = mm["o"](self.attn_decode.view(B, HQ * D), layer.wo)
-            h2 = add_rms_norm(x, o, layer.post_norm, cfg.eps)
-            d = mm["d"](mm["gu"](h2, layer.wgu), layer.wd)
-            h = add_rms_norm(x, d, self._next_norm(i), cfg.eps)
-        logits = mm["lm"](h, m.lm_head)
+        logits = run_layers(self, self.mm, x, self.q_decode, self.attn_decode, self.attention, self.pos, 1, self.rope_fused)
         self.pos.add_(1)
         return logits
 
@@ -279,34 +324,13 @@ class VerifyPlan:
         self.attn_out = torch.empty((B, R, HQ, D), dtype=bf16, device=dev)
         log = lambda s: print(f"[engine] {s}", file=sys.stderr, flush=True)
         self.attention = pick_attention(B, HQ, HKV, D, plan.cap, plan.T + plan.max_new // 2, dev, log, R=R)
-        x = torch.randn((B * R, cfg.hidden), dtype=bf16, device=dev)
-        a = torch.randn((B * R, HQ * D), dtype=bf16, device=dev)
-        act = torch.randn((B * R, cfg.intermediate), dtype=bf16, device=dev)
-        self.mm = {
-            "qkv": pick_matmul(x, m.layers[0].wqkv, log),
-            "o": pick_matmul(a, m.layers[0].wo, log),
-            "gu": pick_gateup(x, m.layers[0].wgu, log),
-            "d": pick_matmul(act, m.layers[0].wd, log),
-            "lm": pick_matmul(x, m.lm_head, log),
-        }
+        self.mm = decode_matmuls(m, B * R, log)
 
     @torch.inference_mode()
     def verify(self) -> torch.Tensor:
         """Consume ``blk`` at ``pos``; returns [B, R] greedy tokens, one per row."""
-        plan, mm = self.plan, self.mm
-        m, cfg = plan.model, plan.model.cfg
+        plan = self.plan
         B, R = plan.B, self.R
-        HQ, D = cfg.heads, cfg.head_dim
-        x = F.embedding(self.blk.view(-1), m.embed)
-        h = rms_norm(x, m.layers[0].in_norm, cfg.eps)
-        for i, layer in enumerate(m.layers):
-            qkv = mm["qkv"](h, layer.wqkv)
-            qk_norm_rope_cache(qkv, layer.q_norm, layer.k_norm, m.cos, m.sin, self.pos,
-                               self.q, plan.k_cache[i], plan.v_cache[i], R, cfg.eps, fused=plan.rope_fused)
-            self.attention(self.q, plan.k_cache[i], plan.v_cache[i], self.pos, self.attn_out)
-            o = mm["o"](self.attn_out.view(B * R, HQ * D), layer.wo)
-            h2 = add_rms_norm(x, o, layer.post_norm, cfg.eps)
-            d = mm["d"](mm["gu"](h2, layer.wgu), layer.wd)
-            h = add_rms_norm(x, d, plan._next_norm(i), cfg.eps)
-        logits = mm["lm"](h, m.lm_head)
+        x = F.embedding(self.blk.view(-1), plan.model.embed)
+        logits = run_layers(plan, self.mm, x, self.q, self.attn_out, self.attention, self.pos, R, plan.rope_fused)
         return logits.argmax(dim=-1).view(B, R)
