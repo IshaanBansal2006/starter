@@ -107,3 +107,15 @@ score: 977.1500695109738  failure:
 | public-0 | passed | 325.0 | 7.42x | 0.46 | 0.12 |  |
 | public-1 | passed | 429.2 | 3.27x | 0.70 | 0.20 |  |
 | public-2 | passed | 2658.2 | 4.51x | 0.68 | 0.19 |  |
+
+## 2026-09-20 04:19 UTC — official run `8fbe09a1-11f0-4900-9785-df01aa71dd8e` @ `93201ec` — failed
+
+commit 1282d00
+
+score: None  failure: incorrect_output The engine's tokens did not match native Qwen's greedy choice.
+
+| workload | status | tok/s | speedup | ttft ratio | tpot ratio | message |
+|---|---|---:|---:|---:|---:|---|
+| public-0 | passed | 336.8 | 5.90x | 0.55 | 0.16 |  |
+| public-1 | passed | 459.4 | 3.04x | 0.71 | 0.21 |  |
+| public-2 | passed | 2752.6 | 4.12x | 0.69 | 0.21 |  |

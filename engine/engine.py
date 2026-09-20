@@ -332,7 +332,13 @@ class Engine:
         # Minimum verify rounds per sample = (max_new - 1) / tau_floor. Rounds are
         # padded up to it (the last token is held back) so a sample's timing does
         # not depend on how lucky its drafts were: the 25% spread gate.
-        self.tau_floor = float(os.environ.get("ENGINE_TAU_FLOOR", "2.0"))
+        # Per-batch: a lone sequence accepts ~3 tokens a round; with 16 the slowest
+        # sequence sets the pace, and its rounds already vary little.
+        self.tau_floor_by_batch = {1: 2.6, 2: 2.4, 4: 2.2, 8: 1.8}
+        self.tau_floor_default = float(os.environ.get("ENGINE_TAU_FLOOR", "1.4"))
+        # Tree nodes per sequence: each 64 query rows (16 nodes x 4 heads) that a
+        # sequence's tree adds is another pass over its KV cache.
+        self.tree_rows_by_batch = {1: 64, 2: 48, 4: 32, 8: 16, 16: 8, 32: 4}
         self.self_check = os.environ.get("ENGINE_SELF_CHECK", "1") == "1"
         self.checked = False
         budget.start(PICKER_BUDGET_S)
@@ -403,11 +409,14 @@ class Engine:
             self.plans.clear()
             torch.cuda.empty_cache()
             spec_k = self.spec_k if self.spec_k and B * (self.spec_k + 1) <= self.spec_max_rows else None
-            rows = min(64, self.spec_max_rows // B) if self.recycle else 0
+            rows = self.tree_rows_by_batch.get(B, max(0, 128 // B)) if self.recycle else 0
+            rows = min(rows, self.spec_max_rows // B)
             recycle_rows = rows if rows >= 2 else None
             plan = GraphPlan(self.model, B, T, max_new, spec_k=None if recycle_rows else spec_k,
                              recycle_rows=recycle_rows, recycle_k=self.recycle_k)
-            plan.tau_floor = self.tau_floor
+            plan.tau_floor = self.tau_floor_by_batch.get(B, self.tau_floor_default)
+            if os.environ.get("ENGINE_TAU_FLOOR"):
+                plan.tau_floor = float(os.environ["ENGINE_TAU_FLOOR"])
             if self.use_graphs:
                 try:
                     plan.capture()
