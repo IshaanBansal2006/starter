@@ -29,7 +29,11 @@ def _ensure_triton_cache() -> None:
             f.write("ok")
         os.remove(probe)
     except OSError:
-        os.environ["TRITON_CACHE_DIR"] = tempfile.mkdtemp(prefix="triton-cache-")
+        # One fixed directory, not mkdtemp: the run's workload processes share
+        # the container, so compiled kernels must survive from one to the next.
+        shared = os.path.join(tempfile.gettempdir(), "dryft-triton-cache")
+        os.makedirs(shared, exist_ok=True)
+        os.environ["TRITON_CACHE_DIR"] = shared
 
 
 _ensure_triton_cache()
