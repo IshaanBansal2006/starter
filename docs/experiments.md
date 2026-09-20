@@ -31,3 +31,7 @@ Each row is a hypothesis, not a result: "what it tests" is what the toggle
 isolates, not a claim that it wins. Flip one at a time, keep everything else
 fixed, and log the public-run numbers here before ever requesting an official
 run on the change.
+
+## Leaderboard snapshot 2026-09-19 23:25 EDT
+
+Top: Segfault 1280.4 tok/s; places 2-5 at 1137-1144; 56 ranked teams.
