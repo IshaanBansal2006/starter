@@ -21,6 +21,7 @@ import triton.language as tl
 
 from kernels.accept import flat_children
 from kernels.attention import ancestor_masks
+from kernels.topk import fast_topk
 
 #: Rough acceptance probability of a child by its rank among a node's k
 #: candidates, used only to decide which tree nodes are worth a row.
@@ -146,10 +147,13 @@ class Recycler:
         self.spine = torch.full((B, self.SP), -1, dtype=torch.int64, device=device)
         self.spine_anchor = torch.zeros((B,), dtype=torch.int32, device=device)
 
-    def update(self, tokens: torch.Tensor, logits: torch.Tensor) -> None:
-        """Record the top-k next tokens predicted after each of ``tokens`` ([N] int64, logits [N, V])."""
-        top = torch.topk(logits, self.k, dim=-1).indices.to(torch.int32)
+    def update(self, tokens: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
+        """Record the top-k next tokens predicted after each of ``tokens`` ([N] int64,
+        logits [N, V]); returns the exact argmax per row (int64 [N]) so callers
+        need no second pass over the logits."""
+        _, top = fast_topk(logits, self.k)
         self.table.index_copy_(0, tokens, top)
+        return top[:, 0].to(torch.int64)
 
     def draft(self, nseen: torch.Tensor) -> None:
         """Fill ``blk`` from ``root`` by walking the template through the table.

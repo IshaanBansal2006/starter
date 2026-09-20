@@ -109,13 +109,13 @@ def _fits(fn):
 
 
 def test_skinny_matmul_configs_match_cublas():
-    from kernels.gemm import CONFIGS, SkinnyMatmul
+    from kernels.gemm import SkinnyMatmul, _configs_for
     for M in (1, 4, 16, 48, 128):
         for N, K in ((6144, 2560), (2560, 9728), (777, 2560)):
             a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
             w = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.02
             ref = (a @ w.t()).float()
-            for cfg in CONFIGS:
+            for cfg in _configs_for(M):
                 out = _fits(lambda: SkinnyMatmul(M, N, K, a.device, **cfg)(a, w).float())
                 if out is None:
                     continue
@@ -146,13 +146,14 @@ def test_fused_rope_launch_equals_split_launch():
 
 def test_gateup_configs_match_cublas_swiglu():
     from kernels import swiglu
-    from kernels.gemm import CONFIGS, SkinnyGateUp
+    from kernels.gemm import SkinnyGateUp
     for M in (1, 16):
         I, K = 9728, 2560
         a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
         wgu = torch.randn(2 * I, K, device="cuda", dtype=torch.bfloat16) * 0.02
         ref = swiglu(a @ wgu.t()).float()
-        for cfg in CONFIGS:
+        from kernels.gemm import _configs_for
+        for cfg in _configs_for(M):
             out = _fits(lambda: SkinnyGateUp(M, I, K, a.device, **cfg)(a, wgu[:I], wgu[I:]).float())
             if out is None:
                 continue
@@ -168,8 +169,9 @@ def test_pick_attention_returns_matching_kernel():
 
 def test_norm_prologue_matches_add_norm_then_gemm():
     from kernels import add_rms_norm
-    from kernels.gemm import CONFIGS, SkinnyGateUp, SkinnyMatmul
+    from kernels.gemm import SkinnyGateUp, SkinnyMatmul
     torch.manual_seed(0)
+    from kernels.gemm import _configs_for
     for M in (1, 5, 16, 64, 96):
         K, N, I = 2560, 1536, 1024
         x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
@@ -181,7 +183,7 @@ def test_norm_prologue_matches_add_norm_then_gemm():
         h = add_rms_norm(x, y, wn, 1e-6, xout_ref)
         ref = (h @ w.t()).float()
         ref_gu = torch.nn.functional.silu(h @ wgu[:I].t()) * (h @ wgu[I:].t())
-        for cfg in CONFIGS:
+        for cfg in _configs_for(M):
             xout = torch.empty_like(x)
             out = _fits(lambda: SkinnyMatmul(M, N, K, x.device, **cfg)(x, w, norm=(y, wn, xout, 1e-6)).float())
             if out is not None:
@@ -233,3 +235,18 @@ def test_pickers_respect_budget():
         assert torch.equal(mm(a, w), a @ w.t())
     finally:
         budget.start(1e9)
+
+
+def test_fast_topk_argmax_exact_and_topk_close():
+    from kernels.topk import fast_topk
+    torch.manual_seed(2)
+    for N, V in ((3, 151936), (64, 151936), (5, 1024)):
+        x = torch.randn(N, V, device="cuda", dtype=torch.bfloat16) * 4
+        x[0, 7] = x[0].max() + 1  # unique max
+        x[1, 100] = x[1, 200] = x[1].max() + 2  # exact tie: lowest index must win
+        vals, idxs = fast_topk(x, 8)
+        assert torch.equal(idxs[:, 0].long(), x.argmax(-1))
+        ref = torch.topk(x.float(), 8, dim=-1).indices
+        overlap = sum(len(set(idxs[i].tolist()) & set(ref[i].tolist())) for i in range(N)) / (8 * N)
+        assert overlap > 0.9, overlap
+        assert torch.equal(vals[:, 0], x.float().max(-1).values)
