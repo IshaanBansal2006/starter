@@ -21,9 +21,9 @@ import triton.language as tl
 @triton.jit
 def _split_kernel(
     q_ptr, k_ptr, v_ptr, pos_ptr, o_part_ptr, m_part_ptr, l_part_ptr, o_ptr,
-    CAP, scale,
+    CAP, scale, NSPLIT, SPLIT_LEN,
     HQ: tl.constexpr, HKV: tl.constexpr, G: tl.constexpr, GP: tl.constexpr, R: tl.constexpr,
-    D: tl.constexpr, BLOCK_N: tl.constexpr, NSPLIT: tl.constexpr, SPLIT_LEN: tl.constexpr,
+    D: tl.constexpr, BLOCK_N: tl.constexpr,
     FINAL: tl.constexpr,
 ):
     """Query tile rows are (t, g): query row t of the sequence, head kh*G + g.
@@ -81,8 +81,8 @@ def _split_kernel(
 
 @triton.jit
 def _reduce_kernel(
-    o_part_ptr, m_part_ptr, l_part_ptr, o_ptr,
-    HQ: tl.constexpr, R: tl.constexpr, D: tl.constexpr, NSPLIT: tl.constexpr, NSP: tl.constexpr,
+    o_part_ptr, m_part_ptr, l_part_ptr, o_ptr, NSPLIT,
+    HQ: tl.constexpr, R: tl.constexpr, D: tl.constexpr, NSP: tl.constexpr,
 ):
     b = tl.program_id(0)
     h = tl.program_id(1)
@@ -128,17 +128,17 @@ class DecodeAttention:
         query row 0); out [B, R, HQ, D] bf16, i.e. rows (b, t) of [B*R, HQ*D]."""
         _split_kernel[(self.B, self.HKV, self.NSPLIT)](
             q, k_cache, v_cache, pos, self.o_part, self.m_part, self.l_part, out,
-            self.cap, self.scale,
+            self.cap, self.scale, self.NSPLIT, self.SPLIT_LEN,
             HQ=self.HQ, HKV=self.HKV, G=self.G, GP=self.GP, R=self.R, D=self.D,
-            BLOCK_N=self.BLOCK_N, NSPLIT=self.NSPLIT, SPLIT_LEN=self.SPLIT_LEN,
+            BLOCK_N=self.BLOCK_N,
             FINAL=self.NSPLIT == 1,
             num_warps=self.num_warps, num_stages=self.num_stages,
         )
         if self.NSPLIT == 1:
             return
         _reduce_kernel[(self.B, self.HQ, self.R)](
-            self.o_part, self.m_part, self.l_part, out,
-            HQ=self.HQ, R=self.R, D=self.D, NSPLIT=self.NSPLIT, NSP=self.NSP, num_warps=1,
+            self.o_part, self.m_part, self.l_part, out, self.NSPLIT,
+            HQ=self.HQ, R=self.R, D=self.D, NSP=self.NSP, num_warps=1,
         )
 
 
@@ -218,8 +218,30 @@ def pick_attention(B: int, HQ: int, HKV: int, D: int, cap: int, typical_len: int
             if ms < best_ms:
                 best, best_ms, best_name = attn, ms, f"{cfg} nsplit={attn.NSPLIT}"
     if best is None:
-        raise RuntimeError("no decode attention configuration compiled; see the log above")
+        if log:
+            log("no Triton decode attention configuration works here; using the torch fallback")
+        return TorchDecodeAttention(B, HQ, HKV, D, cap, R, device)
     if log:
         kv_bytes = 2 * B * HKV * L * D * 2
         log(f"attention B={B} R={R} len={L}: {best_name} {best_ms * 1000:.1f}us ({kv_bytes / best_ms / 1e6:.0f} GB/s)")
     return best
+
+
+class TorchDecodeAttention:
+    """Graph-capturable SDPA fallback with an explicit block-causal mask over the
+    full cache capacity. Slower than the Triton kernel; used only if no Triton
+    configuration compiles on the run's hardware."""
+
+    def __init__(self, B: int, HQ: int, HKV: int, D: int, cap: int, R: int, device):
+        self.B, self.HQ, self.HKV, self.D, self.cap, self.R = B, HQ, HKV, D, cap, R
+        self.NSPLIT = 0
+        self.scale = 1.0 / math.sqrt(D)
+        self.keys = torch.arange(cap, device=device, dtype=torch.int32)
+        self.rows = torch.arange(R, device=device, dtype=torch.int32)
+
+    def __call__(self, q, k_cache, v_cache, pos, out) -> None:
+        import torch.nn.functional as F
+
+        mask = self.keys[None, None, None, :] <= (pos[:, None] + self.rows[None, :])[:, None, :, None]
+        o = F.scaled_dot_product_attention(q, k_cache, v_cache, attn_mask=mask, scale=self.scale, enable_gqa=True)
+        out.copy_(o.transpose(1, 2))
