@@ -403,7 +403,7 @@ WIDE_CONFIGS = [
 
 #: A candidate replaces the incumbent only if it is at least this much faster;
 #: run 96040cdf showed a tile that wins a close isolated timing can lose in the round.
-PICK_MARGIN = 0.97
+PICK_MARGIN = 1.0
 
 
 def _configs_for(M: int) -> list:
