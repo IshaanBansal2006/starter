@@ -25,7 +25,13 @@ from kernels.topk import fast_topk
 
 #: Rough acceptance probability of a child by its rank among a node's k
 #: candidates, used only to decide which tree nodes are worth a row.
-RANK_PRIOR = [0.55, 0.16, 0.08, 0.05, 0.035, 0.025, 0.02, 0.015]
+_PRIORS = {
+    "default": [0.55, 0.16, 0.08, 0.05, 0.035, 0.025, 0.02, 0.015],
+    "peaked": [0.70, 0.12, 0.05, 0.03, 0.02, 0.015, 0.01, 0.008],
+    "flat": [0.40, 0.20, 0.12, 0.08, 0.06, 0.05, 0.04, 0.03],
+    "deep": [0.80, 0.08, 0.04, 0.02, 0.015, 0.01, 0.008, 0.006],
+}
+RANK_PRIOR = _PRIORS[__import__("os").environ.get("ENGINE_TREE_PRIOR", "default")]
 
 
 @dataclass
@@ -146,14 +152,30 @@ class Recycler:
         self.SP = self.S + self.maxa + 1
         self.spine = torch.full((B, self.SP), -1, dtype=torch.int64, device=device)
         self.spine_anchor = torch.zeros((B,), dtype=torch.int32, device=device)
+        self.row_max = torch.zeros((B * R,), dtype=torch.float32, device=device)
+        seq = torch.arange(B, device=device, dtype=torch.int64)[:, None] * R
+        self.g_rows = (seq + self.child_par.long()[None, :]).reshape(-1)
+        self.g_child = (seq + self.child_list.long()[None, :]).reshape(-1)
+        self.child_logit = torch.zeros((B, self.child_list.numel()), dtype=torch.float32, device=device)
 
     def update(self, tokens: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
         """Record the top-k next tokens predicted after each of ``tokens`` ([N] int64,
         logits [N, V]); returns the exact argmax per row (int64 [N]) so callers
-        need no second pass over the logits."""
-        _, top = fast_topk(logits, self.k)
+        need no second pass over the logits. The row maxima land in ``row_max``."""
+        vals, top = fast_topk(logits, self.k)
         self.table.index_copy_(0, tokens, top)
+        self.row_max = vals[:, 0]
         return top[:, 0].to(torch.int64)
+
+    def child_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """Logit of every draft child's token at its parent's row: [B, C] float32.
+
+        Slot j of the CSR template is child ``child_list[j]`` of parent
+        ``child_par[j]``; the parent's row of ``logits`` scores the child's token.
+        """
+        rows = self.g_rows
+        cols = self.blk.view(-1)[self.g_child]
+        return logits[rows, cols].float().view(self.B, -1)
 
     def draft(self, nseen: torch.Tensor) -> None:
         """Fill ``blk`` from ``root`` by walking the template through the table.
