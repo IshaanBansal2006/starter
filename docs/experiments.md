@@ -95,3 +95,15 @@ score: 895.4586535213505  failure:
 | public-0 | passed | 215.0 | 3.88x | 0.48 | 0.25 |  |
 | public-1 | passed | 422.7 | 2.78x | 0.61 | 0.28 |  |
 | public-2 | passed | 2806.9 | 4.19x | 0.58 | 0.22 |  |
+
+## 2026-09-20 04:11 UTC — official run `8521efe1-3cc1-4ecd-8de5-1c66d276118c` @ `1282d00` — succeeded
+
+commit 2c3892d
+
+score: 977.1500695109738  failure:  
+
+| workload | status | tok/s | speedup | ttft ratio | tpot ratio | message |
+|---|---|---:|---:|---:|---:|---|
+| public-0 | passed | 325.0 | 7.42x | 0.46 | 0.12 |  |
+| public-1 | passed | 429.2 | 3.27x | 0.70 | 0.20 |  |
+| public-2 | passed | 2658.2 | 4.51x | 0.68 | 0.19 |  |

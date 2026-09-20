@@ -54,37 +54,43 @@ def _normed_tile(x_ptr, y_ptr, wn_ptr, rstd, rm, kk, stride_am, mask):
 @triton.jit
 def _skinny_kernel(
     a_ptr, w_ptr, c_ptr, part_ptr,
-    M, N, K, stride_am, stride_wn, k_per_split,
+    M, N, K, stride_am, stride_wn, k_per_split, num_tiles,
     y_ptr, wn_ptr, xout_ptr, eps,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, SPLIT_K: tl.constexpr,
     NORM: tl.constexpr,
 ):
-    pid_n = tl.program_id(0)
-    pid_k = tl.program_id(1)
+    """Tiles are (n-block, k-split) pairs walked by a persistent 1-D grid: with
+    fewer programs than tiles each program loops, so the work always fills the
+    SMs in whole waves instead of leaving a fractional last wave idle."""
+    pid = tl.program_id(0)
+    nprog = tl.num_programs(0)
     rm = tl.arange(0, BLOCK_M)
-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     rk = tl.arange(0, BLOCK_K)
     m_mask = rm < M
-    n_mask = rn < N
-    k_start = pid_k * k_per_split
-    k_end = tl.minimum(k_start + k_per_split, K)
     if NORM:
-        rstd = _norm_stats(a_ptr, y_ptr, xout_ptr, M, K, stride_am, eps, (pid_n == 0) & (pid_k == 0), BLOCK_M, BLOCK_K)
-    acc = tl.zeros([BLOCK_M, BLOCK_N], tl.float32)
-    for k0 in range(k_start, k_end, BLOCK_K):
-        kk = k0 + rk
-        k_mask = kk < k_end
-        a_mask = m_mask[:, None] & k_mask[None, :]
-        if NORM:
-            a = _normed_tile(a_ptr, y_ptr, wn_ptr, rstd, rm, kk, stride_am, a_mask)
+        rstd = _norm_stats(a_ptr, y_ptr, xout_ptr, M, K, stride_am, eps, pid == 0, BLOCK_M, BLOCK_K)
+    for tile in range(pid, num_tiles, nprog):
+        pid_n = tile // SPLIT_K
+        pid_k = tile % SPLIT_K
+        rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        n_mask = rn < N
+        k_start = pid_k * k_per_split
+        k_end = tl.minimum(k_start + k_per_split, K)
+        acc = tl.zeros([BLOCK_M, BLOCK_N], tl.float32)
+        for k0 in range(k_start, k_end, BLOCK_K):
+            kk = k0 + rk
+            k_mask = kk < k_end
+            a_mask = m_mask[:, None] & k_mask[None, :]
+            if NORM:
+                a = _normed_tile(a_ptr, y_ptr, wn_ptr, rstd, rm, kk, stride_am, a_mask)
+            else:
+                a = tl.load(a_ptr + rm[:, None] * stride_am + kk[None, :], mask=a_mask, other=0.0)
+            w = tl.load(w_ptr + rn[:, None] * stride_wn + kk[None, :], mask=n_mask[:, None] & k_mask[None, :], other=0.0)
+            acc += tl.dot(a, tl.trans(w))
+        if SPLIT_K == 1:
+            tl.store(c_ptr + rm[:, None] * N + rn[None, :], acc.to(tl.bfloat16), mask=m_mask[:, None] & n_mask[None, :])
         else:
-            a = tl.load(a_ptr + rm[:, None] * stride_am + kk[None, :], mask=a_mask, other=0.0)
-        w = tl.load(w_ptr + rn[:, None] * stride_wn + kk[None, :], mask=n_mask[:, None] & k_mask[None, :], other=0.0)
-        acc += tl.dot(a, tl.trans(w))
-    if SPLIT_K == 1:
-        tl.store(c_ptr + rm[:, None] * N + rn[None, :], acc.to(tl.bfloat16), mask=m_mask[:, None] & n_mask[None, :])
-    else:
-        tl.store(part_ptr + (pid_k * M + rm[:, None]) * N + rn[None, :], acc, mask=m_mask[:, None] & n_mask[None, :])
+            tl.store(part_ptr + (pid_k * M + rm[:, None]) * N + rn[None, :], acc, mask=m_mask[:, None] & n_mask[None, :])
 
 
 @triton.jit
@@ -110,42 +116,45 @@ def _swiglu_epilogue(g, u):
 @triton.jit
 def _gateup_kernel(
     a_ptr, wg_ptr, wu_ptr, c_ptr, part_ptr,
-    M, N, K, stride_am, stride_wn, k_per_split,
+    M, N, K, stride_am, stride_wn, k_per_split, num_tiles,
     y_ptr, wn_ptr, xout_ptr, eps,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, SPLIT_K: tl.constexpr,
     NORM: tl.constexpr,
 ):
-    pid_n = tl.program_id(0)
-    pid_k = tl.program_id(1)
+    pid = tl.program_id(0)
+    nprog = tl.num_programs(0)
     rm = tl.arange(0, BLOCK_M)
-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     rk = tl.arange(0, BLOCK_K)
     m_mask = rm < M
-    n_mask = rn < N
-    k_start = pid_k * k_per_split
-    k_end = tl.minimum(k_start + k_per_split, K)
     if NORM:
-        rstd = _norm_stats(a_ptr, y_ptr, xout_ptr, M, K, stride_am, eps, (pid_n == 0) & (pid_k == 0), BLOCK_M, BLOCK_K)
-    acc_g = tl.zeros([BLOCK_M, BLOCK_N], tl.float32)
-    acc_u = tl.zeros([BLOCK_M, BLOCK_N], tl.float32)
-    for k0 in range(k_start, k_end, BLOCK_K):
-        kk = k0 + rk
-        k_mask = kk < k_end
-        a_mask = m_mask[:, None] & k_mask[None, :]
-        if NORM:
-            a = _normed_tile(a_ptr, y_ptr, wn_ptr, rstd, rm, kk, stride_am, a_mask)
+        rstd = _norm_stats(a_ptr, y_ptr, xout_ptr, M, K, stride_am, eps, pid == 0, BLOCK_M, BLOCK_K)
+    for tile in range(pid, num_tiles, nprog):
+        pid_n = tile // SPLIT_K
+        pid_k = tile % SPLIT_K
+        rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        n_mask = rn < N
+        k_start = pid_k * k_per_split
+        k_end = tl.minimum(k_start + k_per_split, K)
+        acc_g = tl.zeros([BLOCK_M, BLOCK_N], tl.float32)
+        acc_u = tl.zeros([BLOCK_M, BLOCK_N], tl.float32)
+        for k0 in range(k_start, k_end, BLOCK_K):
+            kk = k0 + rk
+            k_mask = kk < k_end
+            a_mask = m_mask[:, None] & k_mask[None, :]
+            if NORM:
+                a = _normed_tile(a_ptr, y_ptr, wn_ptr, rstd, rm, kk, stride_am, a_mask)
+            else:
+                a = tl.load(a_ptr + rm[:, None] * stride_am + kk[None, :], mask=a_mask, other=0.0)
+            wg = tl.load(wg_ptr + rn[:, None] * stride_wn + kk[None, :], mask=n_mask[:, None] & k_mask[None, :], other=0.0)
+            wu = tl.load(wu_ptr + rn[:, None] * stride_wn + kk[None, :], mask=n_mask[:, None] & k_mask[None, :], other=0.0)
+            acc_g += tl.dot(a, tl.trans(wg))
+            acc_u += tl.dot(a, tl.trans(wu))
+        out_mask = m_mask[:, None] & n_mask[None, :]
+        if SPLIT_K == 1:
+            tl.store(c_ptr + rm[:, None] * N + rn[None, :], _swiglu_epilogue(acc_g, acc_u), mask=out_mask)
         else:
-            a = tl.load(a_ptr + rm[:, None] * stride_am + kk[None, :], mask=a_mask, other=0.0)
-        wg = tl.load(wg_ptr + rn[:, None] * stride_wn + kk[None, :], mask=n_mask[:, None] & k_mask[None, :], other=0.0)
-        wu = tl.load(wu_ptr + rn[:, None] * stride_wn + kk[None, :], mask=n_mask[:, None] & k_mask[None, :], other=0.0)
-        acc_g += tl.dot(a, tl.trans(wg))
-        acc_u += tl.dot(a, tl.trans(wu))
-    out_mask = m_mask[:, None] & n_mask[None, :]
-    if SPLIT_K == 1:
-        tl.store(c_ptr + rm[:, None] * N + rn[None, :], _swiglu_epilogue(acc_g, acc_u), mask=out_mask)
-    else:
-        tl.store(part_ptr + (pid_k * M + rm[:, None]) * N + rn[None, :], acc_g, mask=out_mask)
-        tl.store(part_ptr + ((SPLIT_K + pid_k) * M + rm[:, None]) * N + rn[None, :], acc_u, mask=out_mask)
+            tl.store(part_ptr + (pid_k * M + rm[:, None]) * N + rn[None, :], acc_g, mask=out_mask)
+            tl.store(part_ptr + ((SPLIT_K + pid_k) * M + rm[:, None]) * N + rn[None, :], acc_u, mask=out_mask)
 
 
 @triton.jit
@@ -279,10 +288,18 @@ GEMV_CONFIGS = [
 ]
 
 
+def _sm_count(device) -> int:
+    try:
+        return torch.cuda.get_device_properties(device).multi_processor_count
+    except Exception:
+        return 132
+
+
 class SkinnyGateUp:
     """``swiglu(a @ wg.T, a @ wu.T)`` in one pass over both weight halves."""
 
-    def __init__(self, M: int, N: int, K: int, device, block_n: int, block_k: int, split_k: int, num_warps: int, num_stages: int):
+    def __init__(self, M: int, N: int, K: int, device, block_n: int, block_k: int, split_k: int, num_warps: int,
+                 num_stages: int, persist: int = 0):
         self.M, self.N, self.K = M, N, K
         self.BLOCK_M = 16 if M <= 16 else 32
         self.BLOCK_N, self.BLOCK_K = block_n, block_k
@@ -290,7 +307,9 @@ class SkinnyGateUp:
         self.k_per_split = triton.cdiv(triton.cdiv(K, split_k), block_k) * block_k
         self.SPLIT_K = triton.cdiv(K, self.k_per_split)
         self.part = torch.empty((2 * self.SPLIT_K, M, N), dtype=torch.float32, device=device) if self.SPLIT_K > 1 else None
-        self.grid = (triton.cdiv(N, block_n), self.SPLIT_K)
+        self.num_tiles = triton.cdiv(N, block_n) * self.SPLIT_K
+        programs = min(self.num_tiles, persist * _sm_count(device)) if persist else self.num_tiles
+        self.grid = (programs,)
 
     def __call__(self, a: torch.Tensor, wg: torch.Tensor, wu: torch.Tensor, norm=None) -> torch.Tensor:
         """``norm=(y, w_norm, xout, eps)`` fuses ``xout = a + y; a = rms_norm(xout, w_norm)`` in front."""
@@ -298,7 +317,7 @@ class SkinnyGateUp:
         y, wn, xout, eps = norm if norm is not None else (a, wg, a, 0.0)
         _gateup_kernel[self.grid](
             a, wg, wu, c, self.part if self.part is not None else c,
-            self.M, self.N, self.K, a.stride(0), wg.stride(0), self.k_per_split,
+            self.M, self.N, self.K, a.stride(0), wg.stride(0), self.k_per_split, self.num_tiles,
             y, wn, xout, eps,
             BLOCK_M=self.BLOCK_M, BLOCK_N=self.BLOCK_N, BLOCK_K=self.BLOCK_K, SPLIT_K=self.SPLIT_K,
             NORM=norm is not None,
@@ -311,7 +330,8 @@ class SkinnyGateUp:
 
 
 class SkinnyMatmul:
-    def __init__(self, M: int, N: int, K: int, device, block_n: int, block_k: int, split_k: int, num_warps: int, num_stages: int):
+    def __init__(self, M: int, N: int, K: int, device, block_n: int, block_k: int, split_k: int, num_warps: int,
+                 num_stages: int, persist: int = 0):
         self.M, self.N, self.K = M, N, K
         self.BLOCK_M = 16 if M <= 16 else 32
         self.BLOCK_N, self.BLOCK_K, self.SPLIT_K = block_n, block_k, split_k
@@ -319,7 +339,9 @@ class SkinnyMatmul:
         self.k_per_split = triton.cdiv(triton.cdiv(K, split_k), block_k) * block_k
         self.SPLIT_K = triton.cdiv(K, self.k_per_split)
         self.part = torch.empty((self.SPLIT_K, M, N), dtype=torch.float32, device=device) if self.SPLIT_K > 1 else None
-        self.grid = (triton.cdiv(N, block_n), self.SPLIT_K)
+        self.num_tiles = triton.cdiv(N, block_n) * self.SPLIT_K
+        programs = min(self.num_tiles, persist * _sm_count(device)) if persist else self.num_tiles
+        self.grid = (programs,)
 
     def __call__(self, a: torch.Tensor, w: torch.Tensor, norm=None) -> torch.Tensor:
         """``norm=(y, w_norm, xout, eps)`` fuses ``xout = a + y; a = rms_norm(xout, w_norm)`` in front."""
@@ -327,7 +349,7 @@ class SkinnyMatmul:
         y, wn, xout, eps = norm if norm is not None else (a, w, a, 0.0)
         _skinny_kernel[self.grid](
             a, w, c, self.part if self.part is not None else c,
-            self.M, self.N, self.K, a.stride(0), w.stride(0), self.k_per_split,
+            self.M, self.N, self.K, a.stride(0), w.stride(0), self.k_per_split, self.num_tiles,
             y, wn, xout, eps,
             BLOCK_M=self.BLOCK_M, BLOCK_N=self.BLOCK_N, BLOCK_K=self.BLOCK_K, SPLIT_K=self.SPLIT_K,
             NORM=norm is not None,
@@ -345,8 +367,11 @@ CONFIGS = [
     dict(block_n=64, block_k=64, split_k=4, num_warps=4, num_stages=4),
     dict(block_n=32, block_k=128, split_k=4, num_warps=4, num_stages=3),
     dict(block_n=64, block_k=128, split_k=8, num_warps=4, num_stages=3),
-    dict(block_n=128, block_k=64, split_k=4, num_warps=8, num_stages=3),
     dict(block_n=32, block_k=64, split_k=8, num_warps=4, num_stages=4),
+    dict(block_n=64, block_k=128, split_k=1, num_warps=4, num_stages=3, persist=1),
+    dict(block_n=32, block_k=128, split_k=2, num_warps=4, num_stages=3, persist=2),
+    dict(block_n=64, block_k=128, split_k=4, num_warps=4, num_stages=4, persist=2),
+    dict(block_n=32, block_k=128, split_k=4, num_warps=4, num_stages=3, persist=2),
 ]
 
 
