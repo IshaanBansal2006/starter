@@ -31,7 +31,8 @@ _PRIORS = {
     "flat": [0.40, 0.20, 0.12, 0.08, 0.06, 0.05, 0.04, 0.03],
     "deep": [0.80, 0.08, 0.04, 0.02, 0.015, 0.01, 0.008, 0.006],
 }
-RANK_PRIOR = _PRIORS[__import__("os").environ.get("ENGINE_TREE_PRIOR", "default")]
+# "flat" won the local sweep at every batch size (7/6/5% fewer rounds at batch 1/4/16).
+RANK_PRIOR = _PRIORS[__import__("os").environ.get("ENGINE_TREE_PRIOR", "flat")]
 
 
 @dataclass

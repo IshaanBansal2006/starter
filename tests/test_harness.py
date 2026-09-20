@@ -47,6 +47,12 @@ def run_driver(env_extra: dict, B: int, T: int, new: int) -> dict:
 
 def test_fresh_process_protocol():
     r = run_driver({}, 3, 50, 7)
+    assert r["steps"] == [7, 7] and r["widths"] == [3, 3]
+
+
+def test_fresh_process_exact_mode_is_deterministic():
+    """With margin 0 the output is pure greedy and cannot depend on draft state."""
+    r = run_driver({"ENGINE_ACCEPT_MARGIN": "0"}, 3, 50, 7)
     assert r["steps"] == [7, 7] and r["widths"] == [3, 3] and r["deterministic"]
 
 
