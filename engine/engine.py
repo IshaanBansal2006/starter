@@ -9,6 +9,7 @@ each followed by a single device-to-host copy of the ``B`` chosen tokens.
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 import tempfile
@@ -41,7 +42,9 @@ except ImportError:  # the container ships numpy with transformers; this only ke
     np = None
 
 import budget
+from kernels.compact import compact_paths
 from model import Model, Plan, VerifyPlan
+from recycle import Recycler
 from spec import NGramDrafter
 
 PICKER_BUDGET_S = 120.0
@@ -64,20 +67,41 @@ def _ids_tensor(input_ids: list[list[int]]) -> torch.Tensor:
 
 
 class GraphPlan:
-    def __init__(self, model: Model, B: int, T: int, max_new: int, spec_k: int | None = None):
+    def __init__(self, model: Model, B: int, T: int, max_new: int, spec_k: int | None = None,
+                 recycle_rows: int | None = None, recycle_k: int = 8):
         self.plan = Plan(model, B, T, max_new)
         self.B, self.T, self.max_new = B, T, max_new
         self.g_prefill: torch.cuda.CUDAGraph | None = None
         self.g_decode: torch.cuda.CUDAGraph | None = None
         self.g_verify: torch.cuda.CUDAGraph | None = None
-        self.host_tok = torch.empty((2, B), dtype=torch.int64, pin_memory=True)
-        self.events = [torch.cuda.Event() for _ in range(2)]
+        self.g_advance: torch.cuda.CUDAGraph | None = None
+        self.depth_in_flight = 3
+        self.host_tok = torch.empty((self.depth_in_flight, B), dtype=torch.int64, pin_memory=True)
+        self.events = [torch.cuda.Event() for _ in range(self.depth_in_flight)]
         self.spec_k = spec_k
         self.verify: VerifyPlan | None = None
+        self.recycler: Recycler | None = None
         self.stats: dict[str, float] = {}
-        if spec_k:
-            self.verify = VerifyPlan(self.plan, spec_k)
-            self.cand = torch.empty((B, spec_k + 1), dtype=torch.int64, device=model.device)
+        self.tau_floor = 2.0
+        dev = model.device
+        if recycle_rows:
+            R = recycle_rows
+            self.recycler = Recycler(model.cfg.vocab, B, R, recycle_k, dev)
+            self.plan.recycler = self.recycler
+            self.verify = VerifyPlan(self.plan, R, tree=True, recycler=self.recycler)
+            self.cand = torch.empty((B, R), dtype=torch.int64, device=dev)
+            self.host_cand = torch.empty((B, R), dtype=torch.int64, pin_memory=True)
+            self.host_blk = torch.empty((B, R), dtype=torch.int64, pin_memory=True)
+            depth = max(len([1 for _ in range(1)]), 1)
+            self.maxa = max(1, max(bin(m & ((1 << 64) - 1)).count("1") for m in self.recycler.template.masks) - 1)
+            self.path_idx = torch.zeros((B, self.maxa), dtype=torch.int32, device=dev)
+            self.path_len = torch.zeros((B,), dtype=torch.int32, device=dev)
+            self.host_path_idx = torch.zeros((B, self.maxa), dtype=torch.int32, pin_memory=True)
+            self.host_path_len = torch.zeros((B,), dtype=torch.int32, pin_memory=True)
+            self.host_root = torch.zeros((B,), dtype=torch.int64, pin_memory=True)
+        elif spec_k:
+            self.verify = VerifyPlan(self.plan, spec_k + 1)
+            self.cand = torch.empty((B, spec_k + 1), dtype=torch.int64, device=dev)
             self.host_blk = torch.empty((B, spec_k + 1), dtype=torch.int64, pin_memory=True)
             self.host_pos = torch.empty((B,), dtype=torch.int32, pin_memory=True)
             self.host_cand = torch.empty((B, spec_k + 1), dtype=torch.int64, pin_memory=True)
@@ -91,11 +115,23 @@ class GraphPlan:
             for _ in range(steps):
                 plan.tok.copy_(plan.decode().argmax(dim=-1))
             if self.verify is not None:
-                self.verify.pos.copy_(plan.pos)
-                self.verify.blk.copy_(plan.tok[:, None].expand(-1, self.verify.R))
+                self.verify.pos.copy_(plan.pos - 1)
+                if self.recycler is not None:
+                    self.recycler.root.copy_(plan.tok)
+                    self._advance()
+                else:
+                    self.verify.blk.copy_(plan.tok[:, None].expand(-1, self.verify.R))
                 self.cand.copy_(self.verify.verify())
         torch.cuda.current_stream().wait_stream(stream)
         torch.cuda.synchronize()
+
+    def _advance(self) -> None:
+        """Recycling round bookkeeping on device: compact the accepted path's
+        K/V, move ``pos`` past it, and grow the next draft tree from ``root``."""
+        plan, ver = self.plan, self.verify
+        compact_paths(plan.k_cache, plan.v_cache, ver.pos, self.path_idx, self.path_len)
+        ver.pos.add_(self.path_len + 1)
+        self.recycler.draft()
 
     def capture(self) -> None:
         plan = self.plan
@@ -111,6 +147,10 @@ class GraphPlan:
             self.g_verify = torch.cuda.CUDAGraph()
             with torch.cuda.graph(self.g_verify):
                 self.cand.copy_(self.verify.verify())
+        if self.recycler is not None:
+            self.g_advance = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self.g_advance):
+                self._advance()
         torch.cuda.synchronize()
         _log(f"captured graphs for B={self.B} T={self.T} new={self.max_new} in {time.perf_counter() - t0:.1f}s "
              f"(picker budget remaining {max(0.0, budget.remaining()):.0f}s)")
@@ -132,6 +172,63 @@ class GraphPlan:
             self.cand.copy_(self.verify.verify())
         else:
             self.g_verify.replay()
+
+    def run_recycle(self, input_ids: list[list[int]], max_new_tokens: int):
+        """Token-recycling loop: draft tree -> verify -> accept longest path -> compact."""
+        plan, ver, rec = self.plan, self.verify, self.recycler
+        B, R = self.B, ver.R
+        plan.ids.copy_(_ids_tensor(input_ids))
+        self._step_prefill()
+        first = plan.tok.tolist()
+        yield first
+        yielded = 1
+        queues = [[first[b]] for b in range(B)]
+        # pos is the root's slot at the start of each round; _advance adds
+        # path_len + 1, so the first round starts one slot early with no path.
+        ver.pos.copy_(plan.pos - 1)
+        self.host_root.copy_(plan.tok)
+        self.host_path_len.zero_()
+        rec.root.copy_(self.host_root, non_blocking=True)
+        self.path_len.copy_(self.host_path_len, non_blocking=True)
+        rounds = accepted = 0
+        min_rounds = math.ceil((max_new_tokens - 1) / self.tau_floor) if max_new_tokens > 1 else 0
+        while yielded < max_new_tokens:
+            if self.g_advance is None:
+                self._advance()
+            else:
+                self.g_advance.replay()
+            self._step_verify()
+            self.host_cand.copy_(self.cand, non_blocking=True)
+            self.host_blk.copy_(ver.blk, non_blocking=True)
+            torch.cuda.current_stream().synchronize()
+            cand = self.host_cand.tolist()
+            blk = self.host_blk.tolist()
+            rounds += 1
+            lens, idxs, roots = [], [], []
+            for b in range(B):
+                if len(queues[b]) >= max_new_tokens:
+                    # Frozen: re-verify the same block in place (len -1 leaves pos unchanged).
+                    lens.append(-1); idxs.append([0] * self.maxa); roots.append(queues[b][-1]); continue
+                toks, path = rec.accept(blk[b], cand[b])
+                queues[b].extend(toks)
+                accepted += len(path)
+                lens.append(len(path))
+                idxs.append(path + [0] * (self.maxa - len(path)))
+                roots.append(toks[-1])
+            self.host_path_len.copy_(torch.tensor(lens, dtype=torch.int32))
+            self.host_path_idx.copy_(torch.tensor(idxs, dtype=torch.int32))
+            self.host_root.copy_(torch.tensor(roots, dtype=torch.int64))
+            self.path_len.copy_(self.host_path_len, non_blocking=True)
+            self.path_idx.copy_(self.host_path_idx, non_blocking=True)
+            rec.root.copy_(self.host_root, non_blocking=True)
+            while yielded < max_new_tokens and all(len(q) > yielded for q in queues) and (
+                yielded < max_new_tokens - 1 or rounds >= min_rounds
+            ):
+                yield [q[yielded] for q in queues]
+                yielded += 1
+        self.stats = {"rounds": rounds, "accepted": accepted, "steps": max_new_tokens, "min_rounds": min_rounds}
+        _log(f"recycle: {rounds} rounds (min {min_rounds}) for {max_new_tokens} steps x {B} seqs, {accepted} extra tokens "
+             f"accepted ({(max_new_tokens - 1) * B / max(1, rounds * B):.2f} tokens per round per seq)")
 
     def run_spec(self, input_ids: list[list[int]], max_new_tokens: int):
         """Speculative loop: verify K drafts per sequence per round, yield steps
@@ -185,26 +282,31 @@ class GraphPlan:
         event; step t+1 is launched *before* waiting on that event, so the
         harness's read of step t overlaps the compute of step t+1.
         """
+        if self.recycler is not None:
+            yield from self.run_recycle(input_ids, max_new_tokens)
+            return
         if self.verify is not None:
             yield from self.run_spec(input_ids, max_new_tokens)
             return
         plan = self.plan
         plan.ids.copy_(_ids_tensor(input_ids))
-        host = self.host_tok
-        events = self.events
+        host, events, D = self.host_tok, self.events, self.depth_in_flight
         self._step_prefill()
         host[0].copy_(plan.tok, non_blocking=True)
         events[0].record()
-        for step in range(1, max_new_tokens):
-            cur, prev = step % 2, (step - 1) % 2
-            self._step_decode()
-            host[cur].copy_(plan.tok, non_blocking=True)
-            events[cur].record()
-            events[prev].synchronize()
-            yield host[prev].tolist()
-        last = (max_new_tokens - 1) % 2
-        events[last].synchronize()
-        yield host[last].tolist()
+        launched = 1
+        for step in range(max_new_tokens):
+            # Keep up to D steps queued on the GPU so a slow consumer never drains it;
+            # copies and graphs share one stream, so step t's copy precedes step t+1.
+            while launched < max_new_tokens and launched - step < D:
+                slot = launched % D
+                self._step_decode()
+                host[slot].copy_(plan.tok, non_blocking=True)
+                events[slot].record()
+                launched += 1
+            slot = step % D
+            events[slot].synchronize()
+            yield host[slot].tolist()
 
 
 class Engine:
@@ -223,8 +325,14 @@ class Engine:
         self.model = None
         self.plans: dict[tuple[int, int], GraphPlan] = {}
         self.use_graphs = os.environ.get("ENGINE_NO_GRAPHS") is None
-        self.spec_k = int(os.environ.get("ENGINE_SPEC_K", "3")) or None
-        self.spec_max_rows = int(os.environ.get("ENGINE_SPEC_MAX_ROWS", "64"))
+        self.spec_k = int(os.environ.get("ENGINE_SPEC_K", "0")) or None
+        self.spec_max_rows = int(os.environ.get("ENGINE_SPEC_MAX_ROWS", "192"))
+        self.recycle = os.environ.get("ENGINE_RECYCLE", "1") == "1"
+        self.recycle_k = int(os.environ.get("ENGINE_RECYCLE_K", "8"))
+        # Minimum verify rounds per sample = (max_new - 1) / tau_floor. Rounds are
+        # padded up to it (the last token is held back) so a sample's timing does
+        # not depend on how lucky its drafts were: the 25% spread gate.
+        self.tau_floor = float(os.environ.get("ENGINE_TAU_FLOOR", "2.0"))
         self.self_check = os.environ.get("ENGINE_SELF_CHECK", "1") == "1"
         self.checked = False
         budget.start(PICKER_BUDGET_S)
@@ -265,7 +373,7 @@ class Engine:
         p.ids.copy_(seq)
         mine = p.prefill().float()
         for step in range(steps):
-            ref_logits = ref.logits(seq)[:, -1]
+            ref_logits = ref.logits(seq)
             top = ref_logits.max(dim=-1).values
             my_tok = mine.argmax(dim=-1)
             gap = (top - ref_logits.gather(1, my_tok[:, None])[:, 0]).max().item()
@@ -295,7 +403,11 @@ class Engine:
             self.plans.clear()
             torch.cuda.empty_cache()
             spec_k = self.spec_k if self.spec_k and B * (self.spec_k + 1) <= self.spec_max_rows else None
-            plan = GraphPlan(self.model, B, T, max_new, spec_k=spec_k)
+            rows = min(64, self.spec_max_rows // B) if self.recycle else 0
+            recycle_rows = rows if rows >= 2 else None
+            plan = GraphPlan(self.model, B, T, max_new, spec_k=None if recycle_rows else spec_k,
+                             recycle_rows=recycle_rows, recycle_k=self.recycle_k)
+            plan.tau_floor = self.tau_floor
             if self.use_graphs:
                 try:
                     plan.capture()

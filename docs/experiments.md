@@ -47,3 +47,51 @@ score: 763.5456265036153  failure:
 | public-0 | passed | 201.0 | 4.42x | 0.44 | 0.22 |  |
 | public-1 | passed | 415.5 | 3.02x | 0.62 | 0.25 |  |
 | public-2 | passed | 2468.4 | 3.80x | 0.59 | 0.24 |  |
+
+## 2026-09-20 03:44 UTC — official run `b6937394-23b3-4aab-8939-63bf154c1f5b` @ `1f5175f` — succeeded
+
+spec K=3 default (n-gram drafts), otherwise v1
+
+score: 754.1165863097582  failure:  
+
+| workload | status | tok/s | speedup | ttft ratio | tpot ratio | message |
+|---|---|---:|---:|---:|---:|---|
+| public-0 | passed | 193.6 | 6.89x | 0.25 | 0.14 |  |
+| public-1 | passed | 396.5 | 4.34x | 0.61 | 0.17 |  |
+| public-2 | passed | 2704.2 | 6.67x | 0.59 | 0.13 |  |
+
+## 2026-09-20 03:44 UTC — official run `b6937394-23b3-4aab-8939-63bf154c1f5b` @ `1f5175f` — succeeded
+
+commit 396f4a9
+
+score: 754.1165863097582  failure:  
+
+| workload | status | tok/s | speedup | ttft ratio | tpot ratio | message |
+|---|---|---:|---:|---:|---:|---|
+| public-0 | passed | 193.6 | 6.89x | 0.25 | 0.14 |  |
+| public-1 | passed | 396.5 | 4.34x | 0.61 | 0.17 |  |
+| public-2 | passed | 2704.2 | 6.67x | 0.59 | 0.13 |  |
+
+## 2026-09-20 03:52 UTC — official run `d604c2ee-05e4-4646-9695-4e2ef2b72301` @ `1f5175f` — succeeded
+
+commit adc053d
+
+score: 764.2689895695596  failure:  
+
+| workload | status | tok/s | speedup | ttft ratio | tpot ratio | message |
+|---|---|---:|---:|---:|---:|---|
+| public-0 | passed | 180.5 | 5.02x | 0.34 | 0.19 |  |
+| public-1 | passed | 386.0 | 3.41x | 0.61 | 0.22 |  |
+| public-2 | passed | 2648.0 | 5.08x | 0.59 | 0.18 |  |
+
+## 2026-09-20 03:59 UTC — official run `3e4946f1-f3bf-446a-9661-8c3f8e2b88be` @ `1f5175f` — succeeded
+
+commit 1f5175f
+
+score: 895.4586535213505  failure:  
+
+| workload | status | tok/s | speedup | ttft ratio | tpot ratio | message |
+|---|---|---:|---:|---:|---:|---|
+| public-0 | passed | 215.0 | 3.88x | 0.48 | 0.25 |  |
+| public-1 | passed | 422.7 | 2.78x | 0.61 | 0.28 |  |
+| public-2 | passed | 2806.9 | 4.19x | 0.58 | 0.22 |  |

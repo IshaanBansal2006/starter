@@ -147,7 +147,12 @@ def wait_verbose(api: Dryft, run_id: str, timeout: float) -> dict:
     deadline = time.monotonic() + timeout
     last_state = None
     while True:
-        cur = api.run(run_id)
+        try:
+            cur = api.run(run_id)
+        except Exception as exc:  # transient DNS/HTTP failures must not kill a 10-minute wait
+            print(f"  poll error ({exc}); retrying", flush=True)
+            time.sleep(10)
+            continue
         state = cur.get("state")
         if state != last_state:
             print(f"  {datetime.now().strftime('%H:%M:%S')} run {run_id}: {state}", flush=True)
@@ -168,6 +173,7 @@ def main(argv: list[str]) -> int:
     res = sub.add_parser("result"); res.add_argument("run_id"); res.add_argument("--wait", action="store_true"); res.add_argument("--note", default="")
     lg = sub.add_parser("logs"); lg.add_argument("run_id")
     sub.add_parser("runs"); sub.add_parser("submissions"); sub.add_parser("benchmark"); sub.add_parser("leaderboard")
+    sub.add_parser("watch")
     lt = sub.add_parser("latest"); lt.add_argument("--official", action="store_true"); lt.add_argument("--no-wait", action="store_true"); lt.add_argument("--note", default="")
     pl = sub.add_parser("public-latest"); pl.add_argument("--no-wait", action="store_true"); pl.add_argument("--note", default="")
     args = ap.parse_args(argv)
@@ -181,6 +187,23 @@ def main(argv: list[str]) -> int:
         print(json.dumps(api._send("GET", "/api/v1/submissions"), indent=2)); return 0
     if args.cmd == "logs":
         print_logs(api, args.run_id); return 0
+    if args.cmd == "watch":
+        """Report every non-terminal run as it finishes, oldest first, until none remain."""
+        seen = set()
+        while True:
+            try:
+                runs = api._send("GET", "/api/v1/runs?limit=20").get("items") or []
+            except Exception as exc:
+                print(f"  poll error ({exc}); retrying", flush=True); time.sleep(10); continue
+            pending = [r for r in runs if r.get("state") not in TERMINAL and r["id"] not in seen]
+            if not pending:
+                print("no pending runs"); return 0
+            run = sorted(pending, key=lambda r: r.get("createdAt") or "")[0]
+            print(f"=== waiting on {run['id']} commit {run.get('commitSha', '')[:7]} ({run.get('state')})", flush=True)
+            detail = wait_verbose(api, run["id"], 3600)
+            report(detail)
+            log_experiment(detail, f"commit {detail.get('commitSha', '')[:7]}")
+            seen.add(run["id"])
     if args.cmd == "leaderboard":
         board = api._send("GET", "/api/v1/challenges/decode/leaderboard")
         print(f"ranked teams: {board.get('rankedTeams')}")
