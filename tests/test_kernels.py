@@ -205,3 +205,16 @@ def test_gemv_configs_match_cublas():
             xout = torch.empty_like(a)
             out = Gemv(M, N, K, a.device, **cfg)(a, w, norm=(y, wn, xout, 1e-6)).float()
             assert torch.equal(xout, xout_ref) and (out - ref_n).abs().max().item() <= tol(ref_n), (M, cfg)
+
+
+def test_pickers_respect_budget():
+    import budget
+    from kernels import pick_matmul
+    budget.start(-1.0)
+    try:
+        a = torch.randn(1, 2560, device="cuda", dtype=torch.bfloat16)
+        w = torch.randn(1536, 2560, device="cuda", dtype=torch.bfloat16)
+        mm = pick_matmul(a, w)
+        assert torch.equal(mm(a, w), a @ w.t())
+    finally:
+        budget.start(1e9)

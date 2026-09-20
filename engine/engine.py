@@ -40,8 +40,11 @@ try:
 except ImportError:  # the container ships numpy with transformers; this only keeps the engine importable without it
     np = None
 
+import budget
 from model import Model, Plan, VerifyPlan
 from spec import NGramDrafter
+
+PICKER_BUDGET_S = 120.0
 
 SELF_CHECK_STEPS = 6
 SELF_CHECK_TOPK = 10
@@ -109,7 +112,8 @@ class GraphPlan:
             with torch.cuda.graph(self.g_verify):
                 self.cand.copy_(self.verify.verify())
         torch.cuda.synchronize()
-        _log(f"captured graphs for B={self.B} T={self.T} new={self.max_new} in {time.perf_counter() - t0:.1f}s")
+        _log(f"captured graphs for B={self.B} T={self.T} new={self.max_new} in {time.perf_counter() - t0:.1f}s "
+             f"(picker budget remaining {max(0.0, budget.remaining()):.0f}s)")
 
     def _step_prefill(self) -> None:
         if self.g_prefill is None:
@@ -223,6 +227,7 @@ class Engine:
         self.spec_max_rows = int(os.environ.get("ENGINE_SPEC_MAX_ROWS", "64"))
         self.self_check = os.environ.get("ENGINE_SELF_CHECK", "1") == "1"
         self.checked = False
+        budget.start(PICKER_BUDGET_S)
         t0 = time.perf_counter()
         try:
             self.model = Model(model_path)
