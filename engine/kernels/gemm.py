@@ -409,7 +409,9 @@ def _probe_wide(kind: str, M: int, N: int, K: int, cfg: dict, log=None) -> bool:
     would end the run, so it is tried where a crash costs nothing.
     """
     import subprocess, sys, json
-    key = (kind, _block_m(M), json.dumps(cfg, sort_keys=True))
+    # One probe per (kernel kind, tile height): every wide config shares the same
+    # code path, and a probe costs ~10 s of the 300 s load budget.
+    key = (kind, _block_m(M))
     if key in _PROBED:
         return _PROBED[key]
     code = (
