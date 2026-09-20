@@ -33,7 +33,7 @@ _PRIORS = {
     "flatter": [0.30, 0.20, 0.15, 0.11, 0.09, 0.07, 0.05, 0.04],
 }
 # "flat" won the local sweep at every batch size (7/6/5% fewer rounds at batch 1/4/16).
-RANK_PRIOR = _PRIORS[__import__("os").environ.get("ENGINE_TREE_PRIOR", "default")]
+RANK_PRIOR = _PRIORS[__import__("os").environ.get("ENGINE_TREE_PRIOR", "flat")]
 
 
 @dataclass
