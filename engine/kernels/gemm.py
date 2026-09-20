@@ -226,7 +226,6 @@ CONFIGS = [
     dict(block_n=32, block_k=128, split_k=4, num_warps=4, num_stages=3),
     dict(block_n=64, block_k=128, split_k=8, num_warps=4, num_stages=3),
     dict(block_n=128, block_k=64, split_k=4, num_warps=8, num_stages=3),
-    dict(block_n=16, block_k=256, split_k=2, num_warps=4, num_stages=3),
     dict(block_n=32, block_k=64, split_k=8, num_warps=4, num_stages=4),
 ]
 
