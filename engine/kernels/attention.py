@@ -94,11 +94,13 @@ def _reduce_kernel(
 class DecodeAttention:
     """Workspace-owning wrapper; one instance per (B, HQ, cap) plan."""
 
-    def __init__(self, B: int, HQ: int, HKV: int, D: int, cap: int, device, nsplit: int | None = None):
+    def __init__(self, B: int, HQ: int, HKV: int, D: int, cap: int, device, nsplit: int | None = None,
+                 block_n: int = 64, num_warps: int = 4, num_stages: int = 2):
         self.B, self.HQ, self.HKV, self.D, self.cap = B, HQ, HKV, D, cap
         self.G = HQ // HKV
         self.GP = max(16, triton.next_power_of_2(self.G))
-        self.BLOCK_N = 64
+        self.BLOCK_N = block_n
+        self.num_warps, self.num_stages = num_warps, num_stages
         if nsplit is None:
             nsplit = max(1, min(16, (256 + B * HKV - 1) // (B * HKV)))
         blocks = triton.cdiv(cap, self.BLOCK_N)
@@ -119,7 +121,7 @@ class DecodeAttention:
             HQ=self.HQ, HKV=self.HKV, G=self.G, GP=self.GP, D=self.D,
             BLOCK_N=self.BLOCK_N, NSPLIT=self.NSPLIT, SPLIT_LEN=self.SPLIT_LEN,
             FINAL=self.NSPLIT == 1,
-            num_warps=4, num_stages=2,
+            num_warps=self.num_warps, num_stages=self.num_stages,
         )
         if self.NSPLIT == 1:
             return
@@ -127,3 +129,69 @@ class DecodeAttention:
             self.o_part, self.m_part, self.l_part, out,
             HQ=self.HQ, D=self.D, NSPLIT=self.NSPLIT, NSP=self.NSP, num_warps=1,
         )
+
+
+ATTN_CONFIGS = [
+    dict(block_n=64, num_warps=4, num_stages=2),
+    dict(block_n=128, num_warps=4, num_stages=2),
+    dict(block_n=128, num_warps=8, num_stages=3),
+    dict(block_n=64, num_warps=4, num_stages=3),
+    dict(block_n=32, num_warps=4, num_stages=3),
+]
+
+
+def _time(fn, iters: int = 30) -> float:
+    for _ in range(3):
+        fn()
+    torch.cuda.synchronize()
+    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        fn()
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) / iters
+
+
+def pick_attention(B: int, HQ: int, HKV: int, D: int, cap: int, typical_len: int, device, log=None) -> DecodeAttention:
+    """Time every (config, split) pair on synthetic data at a typical sequence
+    length and keep the fastest whose output matches SDPA; the split count
+    trades parallelism against the extra reduce launch, so it is measured too."""
+    import torch.nn.functional as F
+
+    q = torch.randn((B, HQ, D), dtype=torch.bfloat16, device=device)
+    k = torch.randn((B, HKV, cap, D), dtype=torch.bfloat16, device=device)
+    v = torch.randn((B, HKV, cap, D), dtype=torch.bfloat16, device=device)
+    pos = torch.full((B,), typical_len - 1, dtype=torch.int32, device=device)
+    out = torch.empty_like(q)
+    L = typical_len
+    ref = F.scaled_dot_product_attention(
+        q[:, :, None], k[:, :, :L], v[:, :, :L], scale=D ** -0.5, enable_gqa=True
+    )[:, :, 0].float()
+    programs_wanted = 256
+    base = max(1, (programs_wanted + B * HKV - 1) // (B * HKV))
+    splits = sorted({1, max(1, base // 2), base, min(32, base * 2)})
+    best, best_ms, best_name = None, float("inf"), ""
+    for cfg in ATTN_CONFIGS:
+        for nsplit in splits:
+            try:
+                attn = DecodeAttention(B, HQ, HKV, D, cap, device, nsplit=nsplit, **cfg)
+                attn(q, k, v, pos, out)
+                err = (out.float() - ref).abs().max().item()
+                if err > 0.02 * ref.abs().max().item() + 1e-3:
+                    if log:
+                        log(f"attention {cfg} nsplit={nsplit} rejected: err {err:.4g}")
+                    continue
+                ms = _time(lambda: attn(q, k, v, pos, out))
+            except Exception as exc:
+                if log:
+                    log(f"attention {cfg} nsplit={nsplit} failed: {exc}")
+                continue
+            if ms < best_ms:
+                best, best_ms, best_name = attn, ms, f"{cfg} nsplit={attn.NSPLIT}"
+    if best is None:
+        raise RuntimeError("no decode attention configuration compiled; see the log above")
+    if log:
+        kv_bytes = 2 * B * HKV * L * D * 2
+        log(f"attention B={B} len={L}: {best_name} {best_ms * 1000:.1f}us ({kv_bytes / best_ms / 1e6:.0f} GB/s)")
+    return best

@@ -55,6 +55,88 @@ def _sum_kernel(part_ptr, c_ptr, MN, SPLIT_K: tl.constexpr, BLOCK: tl.constexpr)
     tl.store(c_ptr + idx, acc.to(tl.bfloat16), mask=mask)
 
 
+@triton.jit
+def _swiglu_epilogue(g, u):
+    """bf16(gate), bf16(up), silu in fp32 rounded to bf16, product rounded to bf16."""
+    gb = g.to(tl.bfloat16).to(tl.float32)
+    ub = u.to(tl.bfloat16).to(tl.float32)
+    s = (gb / (1.0 + tl.exp(-gb))).to(tl.bfloat16).to(tl.float32)
+    return (s * ub).to(tl.bfloat16)
+
+
+@triton.jit
+def _gateup_kernel(
+    a_ptr, wg_ptr, wu_ptr, c_ptr, part_ptr,
+    M, N, K, stride_am, stride_wn, k_per_split,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, SPLIT_K: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    rm = tl.arange(0, BLOCK_M)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    rk = tl.arange(0, BLOCK_K)
+    m_mask = rm < M
+    n_mask = rn < N
+    k_start = pid_k * k_per_split
+    k_end = tl.minimum(k_start + k_per_split, K)
+    acc_g = tl.zeros([BLOCK_M, BLOCK_N], tl.float32)
+    acc_u = tl.zeros([BLOCK_M, BLOCK_N], tl.float32)
+    for k0 in range(k_start, k_end, BLOCK_K):
+        kk = k0 + rk
+        k_mask = kk < k_end
+        a = tl.load(a_ptr + rm[:, None] * stride_am + kk[None, :], mask=m_mask[:, None] & k_mask[None, :], other=0.0)
+        wg = tl.load(wg_ptr + rn[:, None] * stride_wn + kk[None, :], mask=n_mask[:, None] & k_mask[None, :], other=0.0)
+        wu = tl.load(wu_ptr + rn[:, None] * stride_wn + kk[None, :], mask=n_mask[:, None] & k_mask[None, :], other=0.0)
+        acc_g += tl.dot(a, tl.trans(wg))
+        acc_u += tl.dot(a, tl.trans(wu))
+    out_mask = m_mask[:, None] & n_mask[None, :]
+    if SPLIT_K == 1:
+        tl.store(c_ptr + rm[:, None] * N + rn[None, :], _swiglu_epilogue(acc_g, acc_u), mask=out_mask)
+    else:
+        tl.store(part_ptr + (pid_k * M + rm[:, None]) * N + rn[None, :], acc_g, mask=out_mask)
+        tl.store(part_ptr + ((SPLIT_K + pid_k) * M + rm[:, None]) * N + rn[None, :], acc_u, mask=out_mask)
+
+
+@triton.jit
+def _sum_gateup_kernel(part_ptr, c_ptr, MN, SPLIT_K: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    idx = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = idx < MN
+    g = tl.zeros([BLOCK], tl.float32)
+    u = tl.zeros([BLOCK], tl.float32)
+    for s in range(SPLIT_K):
+        g += tl.load(part_ptr + s * MN + idx, mask=mask, other=0.0)
+        u += tl.load(part_ptr + (SPLIT_K + s) * MN + idx, mask=mask, other=0.0)
+    tl.store(c_ptr + idx, _swiglu_epilogue(g, u), mask=mask)
+
+
+class SkinnyGateUp:
+    """``swiglu(a @ wg.T, a @ wu.T)`` in one pass over both weight halves."""
+
+    def __init__(self, M: int, N: int, K: int, device, block_n: int, block_k: int, split_k: int, num_warps: int, num_stages: int):
+        self.M, self.N, self.K = M, N, K
+        self.BLOCK_M = 16 if M <= 16 else 32
+        self.BLOCK_N, self.BLOCK_K = block_n, block_k
+        self.num_warps, self.num_stages = num_warps, num_stages
+        self.k_per_split = triton.cdiv(triton.cdiv(K, split_k), block_k) * block_k
+        self.SPLIT_K = triton.cdiv(K, self.k_per_split)
+        self.part = torch.empty((2 * self.SPLIT_K, M, N), dtype=torch.float32, device=device) if self.SPLIT_K > 1 else None
+        self.grid = (triton.cdiv(N, block_n), self.SPLIT_K)
+
+    def __call__(self, a: torch.Tensor, wg: torch.Tensor, wu: torch.Tensor) -> torch.Tensor:
+        c = torch.empty((self.M, self.N), dtype=torch.bfloat16, device=a.device)
+        _gateup_kernel[self.grid](
+            a, wg, wu, c, self.part if self.part is not None else c,
+            self.M, self.N, self.K, a.stride(0), wg.stride(0), self.k_per_split,
+            BLOCK_M=self.BLOCK_M, BLOCK_N=self.BLOCK_N, BLOCK_K=self.BLOCK_K, SPLIT_K=self.SPLIT_K,
+            num_warps=self.num_warps, num_stages=self.num_stages,
+        )
+        if self.SPLIT_K > 1:
+            MN = self.M * self.N
+            _sum_gateup_kernel[(triton.cdiv(MN, 1024),)](self.part, c, MN, SPLIT_K=self.SPLIT_K, BLOCK=1024, num_warps=4)
+        return c
+
+
 class SkinnyMatmul:
     def __init__(self, M: int, N: int, K: int, device, block_n: int, block_k: int, split_k: int, num_warps: int, num_stages: int):
         self.M, self.N, self.K = M, N, K
@@ -138,4 +220,37 @@ def pick_matmul(a: torch.Tensor, w: torch.Tensor, log=None):
     if log:
         log(f"matmul M={M} N={N} K={K}: {best_name} {best_ms * 1000:.1f}us "
             f"({2 * M * N * K / best_ms / 1e6:.0f} GFLOP/s, {N * K * 2 / best_ms / 1e6:.0f} GB/s)")
+    return best
+
+
+def pick_gateup(a: torch.Tensor, wgu: torch.Tensor, log=None):
+    """Fastest ``f(a, wgu) -> swiglu(a @ wgu.T)``: cuBLAS + SwiGLU kernel, or the fused Triton GEMM."""
+    from kernels.swiglu import swiglu
+
+    M, K = a.shape
+    I = wgu.shape[0] // 2
+    wg, wu = wgu[:I], wgu[I:]
+    cublas = lambda a, wgu: swiglu(a @ wgu.t())
+    best_name, best_ms, best = "cublas+swiglu", _time(lambda: cublas(a, wgu)), cublas
+    ref = cublas(a, wgu).float()
+    if M <= 32:
+        for cfg in CONFIGS:
+            try:
+                mm = SkinnyGateUp(M, I, K, a.device, **cfg)
+                out = mm(a, wg, wu).float()
+                err = (out - ref).abs().max().item()
+                tol = 0.02 * ref.abs().max().item() + 1e-3
+                if err > tol:
+                    if log:
+                        log(f"gateup {cfg} rejected: err {err:.4g} > {tol:.4g}")
+                    continue
+                ms = _time(lambda: mm(a, wg, wu))
+            except Exception as exc:
+                if log:
+                    log(f"gateup {cfg} failed: {exc}")
+                continue
+            if ms < best_ms:
+                best_name, best_ms, best = f"triton{cfg}", ms, (lambda a, wgu, mm=mm: mm(a, wgu[:I], wgu[I:]))
+    if log:
+        log(f"gateup M={M} I={I} K={K}: {best_name} {best_ms * 1000:.1f}us ({2 * I * K * 2 / best_ms / 1e6:.0f} GB/s)")
     return best

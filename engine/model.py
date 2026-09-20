@@ -17,7 +17,7 @@ import torch
 import torch.nn.functional as F
 from safetensors import safe_open
 
-from kernels import DecodeAttention, add_rms_norm, pick_matmul, qk_norm_rope_cache, rms_norm, swiglu
+from kernels import add_rms_norm, pick_attention, pick_gateup, pick_matmul, qk_norm_rope_cache, rms_norm, swiglu
 
 
 @dataclass(frozen=True)
@@ -152,7 +152,8 @@ class Plan:
         self.q_prefill = torch.empty((B, HQ, T, D), dtype=bf16, device=dev)
         self.q_decode = torch.empty((B, HQ, 1, D), dtype=bf16, device=dev)
         self.attn_decode = torch.empty((B, HQ, D), dtype=bf16, device=dev)
-        self.attention = DecodeAttention(B, HQ, HKV, D, self.cap, dev)
+        log = lambda s: print(f"[engine] {s}", file=sys.stderr, flush=True)
+        self.attention = pick_attention(B, HQ, HKV, D, self.cap, T + max_new // 2, dev, log)
         self.mm = self._pick_decode_matmuls()
 
     def _pick_decode_matmuls(self) -> dict[str, object]:
@@ -166,7 +167,7 @@ class Plan:
         return {
             "qkv": pick_matmul(x, layer.wqkv, log),
             "o": pick_matmul(a, layer.wo, log),
-            "gu": pick_matmul(x, layer.wgu, log),
+            "gu": pick_gateup(x, layer.wgu, log),
             "d": pick_matmul(act, layer.wd, log),
             "lm": pick_matmul(x, m.lm_head, log),
         }
@@ -216,7 +217,7 @@ class Plan:
             self.attention(self.q_decode.view(B, HQ, D), self.k_cache[i], self.v_cache[i], self.pos, self.attn_decode)
             o = mm["o"](self.attn_decode.view(B, HQ * D), layer.wo)
             h2 = add_rms_norm(x, o, layer.post_norm, cfg.eps)
-            d = mm["d"](swiglu(mm["gu"](h2, layer.wgu)), layer.wd)
+            d = mm["d"](mm["gu"](h2, layer.wgu), layer.wd)
             h = add_rms_norm(x, d, self._next_norm(i), cfg.eps)
         logits = mm["lm"](h, m.lm_head)
         self.pos.add_(1)
