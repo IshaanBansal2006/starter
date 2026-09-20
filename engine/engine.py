@@ -438,7 +438,7 @@ class Engine:
         self.spec_k = int(os.environ.get("ENGINE_SPEC_K", "0")) or None
         self.spec_max_rows = int(os.environ.get("ENGINE_SPEC_MAX_ROWS", "192"))
         self.recycle = os.environ.get("ENGINE_RECYCLE", "1") == "1"
-        self.recycle_k = int(os.environ.get("ENGINE_RECYCLE_K", "8"))
+        self.recycle_k = int(os.environ.get("ENGINE_RECYCLE_K", "12"))
         # Minimum verify rounds per sample = (max_new - 1) / tau_floor. Rounds are
         # padded up to it (the last token is held back) so a sample's timing does
         # not depend on how lucky its drafts were: the 25% spread gate.
