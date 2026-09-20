@@ -146,7 +146,9 @@ ATTN_CONFIGS = [
     dict(block_n=64, num_warps=4, num_stages=2),
     dict(block_n=128, num_warps=4, num_stages=2),
     dict(block_n=128, num_warps=8, num_stages=3),
+    dict(block_n=128, num_warps=4, num_stages=3),
     dict(block_n=64, num_warps=4, num_stages=3),
+    dict(block_n=64, num_warps=8, num_stages=4),
     dict(block_n=32, num_warps=4, num_stages=3),
 ]
 
