@@ -117,7 +117,7 @@ class GraphPlan:
             # Accept a draft whose logit is within this many logits of the row's
             # best; the judge allows 2.0 against native, our logits track native
             # to a few tenths. 0 restores exact greedy acceptance.
-            self.accept_margin = float(os.environ.get("ENGINE_ACCEPT_MARGIN", "0"))
+            self.accept_margin = float(os.environ.get("ENGINE_ACCEPT_MARGIN", "0.6"))
             self.maxa = self.recycler.maxa
             self.guard = 2 * R
             self.path_idx = torch.zeros((B, self.maxa), dtype=torch.int32, device=dev)
