@@ -46,9 +46,12 @@ is native Qwen's greedy choice (exact acceptance; the 2-logit tie margin is not 
 | rerun of the same submission (hidden-set variance ±2.5%) | 1230.4 |
 
 Measured and rejected: chain-only n-gram speculation (754), evict-first weight loads (−2%),
-smaller batch-1 trees (−4%), margin acceptance of near-tie drafts (−2%), picker hysteresis (−2%),
-three extra large GEMM tiles (−2% on the hidden set), cuDNN prefill attention (no change),
-64-row attention blocks (crashed on Hopper), 32-row M-tiled GEMMs (streamed weights twice).
+smaller batch-1 trees (−4%), margin acceptance of near-tie drafts (−2 to −3% at both 0.6 and
+0.3 logits: a near-tie draft steers the trajectory away from what the recycling table predicts),
+picker hysteresis (−2%), three extra large GEMM tiles (−2% on the hidden set), cuDNN prefill
+attention (no change), 64-row attention blocks (crashed on Hopper), 32-row M-tiled GEMMs
+(streamed weights twice), removing the round floors (1212, neutral: the natural batch-1 median
+is ~13 rounds, and the spread gate accepted a 24% p10-p90 range).
 
 ## Where the remaining time goes
 
